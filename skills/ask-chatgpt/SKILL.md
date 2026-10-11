@@ -65,8 +65,10 @@ python3 $B usage ["Exact title"]                    # token ledger
 
 - **Never resend automatically.** A failed run may still have sent the message; resending duplicates it.
   Run `status` first.
-- "Clicked Copy but the clipboard never changed" → the user was probably using the mouse/keyboard. Wait for
-  them, then `read-last`.
+- "Clicked Copy but the clipboard never changed" → the user was using the mouse/keyboard, or ChatGPT left the
+  answer's Copy button stuck as "Copied" (it can, once an answer has been copied). The bridge then copies the
+  answer's last code block instead, so ask for structured results inside a code block; otherwise wait, then
+  `read-last`.
 - Timeout, or the `ask` process died while ChatGPT kept working → `status`; if it is still generating, run
   `wait --conversation "<title>"` (background) to collect the reply when it finishes; if it already finished,
   `read-last`.
