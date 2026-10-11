@@ -307,10 +307,18 @@ def open_new_chat(win):
 
 def shows_marker(ui, marker):
     """Our message is on screen: the latest user message stays pinned at the top of the chat, with its
-    attachment chip (a unique file name per run) and text."""
+    attachment chip (a unique file name per run) and text. The sidebar is part of the same page and lists chat
+    titles, which may contain the marker too (e.g. "kb-review A-007"), so it does not count."""
     if not marker:
         return False
-    return any(marker in (e.get("label") or "") or marker in str(e.get("value") or "") for e in ui.els)
+    edge = max((r["bounds"]["x"] + r["bounds"]["width"] for r in conversation_rows(ui)), default=None)
+    for e in ui.els:
+        if marker in (e.get("label") or "") or marker in str(e.get("value") or ""):
+            b = e.get("bounds")
+            if edge is not None and b and b["x"] + b["width"] / 2 < edge:
+                continue
+            return True
+    return False
 
 
 def find_by_marker(win, marker, limit=6):
