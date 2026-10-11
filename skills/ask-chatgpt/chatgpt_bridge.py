@@ -341,14 +341,22 @@ def find_by_marker(win, marker, limit=6):
                 return again.title
             now = again
         # Our message may be scrolled out of view; a finished answer that echoes the marker identifies it.
-        if not now.busy and scroll_to_bottom(win, click_ok=True).answer_copy_button() is not None:
-            try:
-                text = copy_answer(win)
-            except RuntimeError:  # e.g. a chat whose Copy button is stuck: skip it, keep looking
-                continue
-            if marker in text:
-                log(f"Found the run's chat by its answer: now titled {now.title!r}")
-                return now.title
+        if now.busy:
+            log(f"  {now.title!r}: still generating, marker not on screen")
+            continue
+        if scroll_to_bottom(win, click_ok=True).answer_copy_button() is None:
+            log(f"  {now.title!r}: no finished answer to copy")
+            continue
+        try:
+            text = copy_answer(win)
+        except RuntimeError as e:  # e.g. a chat whose Copy button is stuck: skip it, keep looking
+            log(f"  {now.title!r}: {e}")
+            continue
+        if marker in text:
+            log(f"Found the run's chat by its answer: now titled {now.title!r}")
+            return now.title
+        log(f"  {now.title!r}: answer ({len(text)} chars) does not contain {marker!r}")
+    log(f"none of the {min(len(rows), limit)} most recent chats is the run's ({marker!r})")
     return None
 
 
@@ -631,6 +639,29 @@ def wait_for_answer(win, timeout, poll, prev=None, title=None, marker=None):
     raise TimeoutError(f"No finished answer after {timeout}s (it may still be generating; use read-last later).")
 
 
+def code_block_copy_button(ui):
+    """The Copy button in the header of the answer's last code block (headers stay on screen while the block
+    is in view), i.e. the bottom-most "Copy" above the answer's action bar."""
+    bar = ui.answer_copy_button()
+    if bar is None:
+        return None
+    above = [e for e in ui.els if e.get("ax_role") == "AXButton" and e.get("label") == "Copy"
+             and e["bounds"]["y"] < bar["bounds"]["y"] - 20]
+    return max(above, key=lambda e: e["bounds"]["y"]) if above else None
+
+
+def _clicked_text(btn):
+    """Click a copy button; the new clipboard text, or None if the clipboard did not change."""
+    subprocess.run(["pbcopy"], input=SENTINEL, text=True, env=UTF8, check=True)
+    click(btn)
+    for _ in range(20):
+        time.sleep(0.25)
+        text = subprocess.run(["pbpaste"], capture_output=True, text=True, env=UTF8).stdout
+        if text != SENTINEL:
+            return text
+    return None
+
+
 def copy_answer(win):  # caller holds the UI lock
     ui = scroll_to_bottom(win, click_ok=True)
     btn = ui.answer_copy_button() or _missing("a Copy button for an answer")
@@ -644,16 +675,21 @@ def copy_answer(win):  # caller holds the UI lock
         btn = ui.answer_copy_button() or btn
     pk("clipboard", "save", "--slot", "chatgpt_bridge")
     try:
-        subprocess.run(["pbcopy"], input=SENTINEL, text=True, env=UTF8, check=True)
         for _ in range(2):
-            click(btn)
-            for _ in range(20):
-                time.sleep(0.25)
-                text = subprocess.run(["pbpaste"], capture_output=True, text=True, env=UTF8).stdout
-                if text != SENTINEL:
-                    return text
+            text = _clicked_text(btn)
+            if text is not None:
+                return text
             ui = scroll_to_bottom(win, click_ok=True)
             btn = ui.answer_copy_button() or btn
+        # Once an answer has been copied, ChatGPT can leave its Copy button as "Copied" for good, and clicking
+        # it no longer copies. The answer's last code block (where structured answers put their result) still
+        # has a working Copy button of its own.
+        block = code_block_copy_button(ui)
+        if block is not None:
+            text = _clicked_text(block)
+            if text is not None:
+                log("the answer's Copy button is stuck; copied its last code block instead")
+                return text
         raise RuntimeError("Clicked Copy but the clipboard never changed (was the mouse or focus in use?).")
     finally:
         pk("clipboard", "restore", "--slot", "chatgpt_bridge", check=False)
