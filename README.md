@@ -105,7 +105,8 @@ RV=~/.claude/skills/chatgpt-review/review.py
 
 # 1. 建立审查（二选一）
 python3 $RV init --root ~/code/my-project --context "这是一个……的服务，技术栈……，入口在……"
-python3 $RV init --root ~/code/my-project --source-zip 审查包.zip   # 审你打好的快照包
+python3 $RV init --root ~/code/my-project --include web/api src --brief 审查说明.md   # 只审核心目录
+python3 $RV init --root ~/code/my-project --source-zip 审查包.zip   # 审你打好的快照包（只适合单轮）
 
 # 2. 打包、取下一步要发的内容
 python3 $RV pack --root ~/code/my-project
@@ -126,6 +127,8 @@ python3 $RV set F5 --status wontfix --note "只在单进程部署，多进程场
 ```
 
 `--source-zip` 的包里如果有 `00_审查说明.md` / `REVIEW_BRIEF.md`，会作为审查说明（项目背景、重点、要查和不要查的）原样放进提示词；`改动.diff` / `CHANGES.diff` 会作为「相对上次审查的改动」一起发送。也可以用 `--brief FILE`、`--diff FILE` 显式指定。
+
+`--include` 接目录、文件或通配符（相对项目根目录），每一轮都按这个范围从工作区重新打包，所以「改代码 → 下一轮复审」能看到修改。`--source-zip` 审的是解压出来的快照，改动不会反映到下一轮，适合一次性审查。
 
 审查状态都存在 `~/.chatgpt-review/<项目名>-<哈希>/`：每轮的 zip、提示词、ChatGPT 原始回答、`report.html`。**不会往你的项目目录里写任何文件。**
 

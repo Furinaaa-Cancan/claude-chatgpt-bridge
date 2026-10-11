@@ -10,7 +10,7 @@ parts whose files changed or that have fixes or disputes waiting for ChatGPT's v
 State lives outside the project, in ~/.chatgpt-review/<name>-<hash>/ (state.json, round-N/part-K/).
 
     review.py init --root DIR [--name N] [--context T] [--focus T] [--brief FILE]
-                   [--source-zip ZIP] [--diff FILE] [--force]
+                   [--source-zip ZIP] [--diff FILE] [--include PATH ...] [--force]
     review.py pack [--root DIR] [--chunk-tokens 0] [--include-locks] [--max-file-kb 512]
     review.py next [--root DIR]                 # the next part to send: zip, prompt, out, conversation
     review.py prompt [--root DIR] [--part K] [--handoff]
@@ -169,12 +169,22 @@ def skip_reason(rel, data, include_locks, max_kb):
     return None
 
 
+def included(rel, patterns):
+    """A pattern is a directory, a file, or a glob, relative to the project root."""
+    for pat in patterns:
+        pat = pat.strip("/")
+        if rel == pat or rel.startswith(pat + "/") or fnmatch.fnmatch(rel, pat):
+            return True
+    return False
+
+
 def collect(state, include_locks, max_kb):
     root = source_root(state)
     special = {state.get("brief_rel"), state.get("diff_rel")}
+    include = state.get("include") or []
     files, skipped = [], []
     for rel in list_files(root, use_git=not state.get("source")):
-        if rel in special:
+        if rel in special or (include and not included(rel, include)):
             continue
         path = os.path.join(root, rel)
         if not os.path.isfile(path) or os.path.islink(path):
@@ -764,7 +774,7 @@ def cmd_init(args):
         shutil.rmtree(sdir)
     state = {"name": args.name or os.path.basename(root.rstrip("/")), "root": root,
              "focus": args.focus or DEFAULT_FOCUS, "context": args.context or "", "created": now(),
-             "rounds": [], "findings": [], "parts": {}, "partition": {}}
+             "rounds": [], "findings": [], "parts": {}, "partition": {}, "include": args.include or []}
     if args.source_zip:
         # Review a prepared snapshot instead of the working tree; strip a shared top folder.
         src = os.path.join(sdir, "source")
@@ -795,6 +805,7 @@ def cmd_init(args):
     os.makedirs(sdir, exist_ok=True)
     save(state)
     print(json.dumps({"state_dir": sdir, "name": state["name"], "source": state.get("source"),
+                      "include": state["include"],
                       "brief": state.get("brief"), "diff": state.get("diff")}, ensure_ascii=False, indent=2))
 
 
@@ -815,6 +826,8 @@ def main():
     p.add_argument("--brief", help="review instructions to use instead of context/focus")
     p.add_argument("--source-zip", help="review this snapshot zip instead of the working tree")
     p.add_argument("--diff", help="diff of the changes since the last review (split per part)")
+    p.add_argument("--include", nargs="+", metavar="PATH",
+                   help="only review these directories / files / globs (relative to the root), every round")
     p.add_argument("--force", action="store_true")
     p = add("pack", cmd_pack)
     p.add_argument("--chunk-tokens", type=int, default=0,

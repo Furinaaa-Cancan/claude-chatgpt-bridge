@@ -33,7 +33,11 @@ fallback, e.g. when ChatGPT reports large areas it could not read; part numbers 
 
 - **Working tree**: read enough of the project to write a 3–6 sentence context (purpose, stack, entry
   points, constraints), then `python3 $RV init --root <project> --context "<context>" [--focus "<focus>"]`.
-- **Prepared package** (a zip the user built, e.g. a commit snapshot):
+  Add `--include <dir> [<dir> ...]` (dirs, files or globs relative to the root) when the user names the code
+  to review, e.g. only the backend core; every round re-packs that scope from the working tree. A long
+  project-specific brief can be passed with `--brief FILE` instead of context/focus.
+- **Prepared package** (a zip the user built, e.g. a commit snapshot; fixes made in the working tree do not
+  show up in later rounds, so prefer the working tree for a fix/re-review loop):
   `python3 $RV init --root <project> --source-zip <zip>`. A `00_审查说明.md` / `REVIEW_BRIEF.md` inside it is
   used as the review brief (replacing context/focus), and `改动.diff` / `CHANGES.diff` is split per file into
   each part. `--brief FILE` / `--diff FILE` set them explicitly.
@@ -57,6 +61,9 @@ Repeat until `next` says `"done": true`:
 4. When it finishes: `python3 $RV ingest <out> --root <project> --part <part>`. If it reports no JSON, ask in
    the same conversation "请只重新输出上一条回答末尾的 JSON 代码块，不要其他内容。" and ingest that answer.
    If it fails mid-way, follow ask-chatgpt's failure rules (`status`, `read-last`), never blind resend.
+   **Right after ingesting, give the user the HTML**: `python3 $RV report --root <project> --summary
+   "<ChatGPT 报了几条、各级别多少；Claude 正在核实>"`, send it (SendUserFile, display "render") and list the
+   findings by severity in chat. Never hand over the raw JSON — it is only the machine format.
 5. **Verify every new finding yourself** against the source (`status` shows the source root; for a
    `--source-zip` review that is the extracted snapshot). Check the evidence is really there and whether the
    problem is real in context. Then
