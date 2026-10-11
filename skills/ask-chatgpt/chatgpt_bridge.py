@@ -38,6 +38,7 @@ import contextlib
 import fcntl
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -149,11 +150,14 @@ class UI:
 
     def answer_copy_button(self):
         """Copy button on the bottom-most assistant action bar (same row as Regenerate)."""
-        regen = self.all(label="Regenerate response")
-        if not regen:
+        # The action bar under an answer: Copy (shown as "Copied" for a while after a click), Share,
+        # Regenerate response, Rate response, More actions. Any of the latter anchors the row.
+        anchors = [e for e in self.els if e.get("label") in ("Regenerate response", "Rate response", "More actions")]
+        if not anchors:
             return None
-        ry = max(regen, key=lambda e: e["bounds"]["y"])["bounds"]["y"]
-        row = [c for c in self.all(role="AXButton", label="Copy") if abs(c["bounds"]["y"] - ry) < 12]
+        ry = max(anchors, key=lambda e: e["bounds"]["y"])["bounds"]["y"]
+        row = [c for c in self.els if c.get("ax_role") == "AXButton" and c.get("label") in ("Copy", "Copied")
+               and abs(c["bounds"]["y"] - ry) < 12]
         return row[-1] if row else None
 
 
@@ -310,22 +314,31 @@ def shows_marker(ui, marker):
 
 
 def find_by_marker(win, marker, limit=6):
-    """ChatGPT also renames chats that we titled ourselves, so a title can vanish from the sidebar. Open the
-    most recent chats one by one and recognise ours by its marker; returns its current title or None."""
+    """ChatGPT resets a chat's title when its first answer completes (overwriting a title we set while it was
+    still generating), so a title can vanish from the sidebar. Open the most recent chats one by one and
+    recognise ours by its marker; returns its current title or None."""
     ui = observe(win)
     recents = [e for e in ui.all(role="AXButton", label="Recents")]
     top = recents[0]["bounds"]["y"] if recents else ui.window_top + 50
     rows = sorted((e for e in conversation_rows(ui) if e["bounds"]["y"] > top), key=lambda e: e["bounds"]["y"])
     for row in rows[:limit]:
         click(row)
-        time.sleep(1.5)
+        time.sleep(3)  # the title switches before the messages do; a quick read still shows the old chat
         now = observe(win)
         if shows_marker(now, marker):
-            log(f"Found the run's chat by its marker: now titled {now.title!r}")
-            return now.title
+            time.sleep(1.5)
+            again = observe(win)
+            if again.title == now.title and shows_marker(again, marker):
+                log(f"Found the run's chat by its marker: now titled {again.title!r}")
+                return again.title
+            now = again
         # Our message may be scrolled out of view; a finished answer that echoes the marker identifies it.
         if not now.busy and scroll_to_bottom(win, click_ok=True).answer_copy_button() is not None:
-            if marker in copy_answer(win):
+            try:
+                text = copy_answer(win)
+            except RuntimeError:  # e.g. a chat whose Copy button is stuck: skip it, keep looking
+                continue
+            if marker in text:
                 log(f"Found the run's chat by its answer: now titled {now.title!r}")
                 return now.title
     return None
@@ -468,10 +481,14 @@ def pin_title(win, prompt):
     Right after sending, the page is titled with the prompt itself; ChatGPT renames the chat a little
     later. Only a title that differs from the prompt, seen twice while our reply is generating, counts.
     """
-    head = squash(prompt)[:20]
+    # ChatGPT shows the prompt with its Markdown stripped (no backticks, #, *), so compare letters only.
+    def plain(text):
+        return re.sub(r"[^\w]", "", str(text or ""))
+
+    head = plain(prompt)[:20]
 
     def real_title(ui):
-        t = squash(ui.title)
+        t = plain(ui.title)
         if not ui.busy or ui.title in ("", NEW_CHAT_TITLE) or t.startswith(head) or head.startswith(t):
             return None
         return ui.title
@@ -533,15 +550,23 @@ def wait_for_answer(win, timeout, poll, prev=None, title=None, marker=None):
     seen_busy = False
     stable = 0
     away = None
-    last_rows = None
+    maybe = None  # a new title seen once with our marker on screen
     while time.time() - start < timeout:
         time.sleep(poll)
         ui = observe(win)
         # ChatGPT renames a chat while and after answering (seen: prompt text -> "X_request" -> "X发现").
-        if title and ui.title != title and (shows_marker(ui, marker) or renamed(ui, title, last_rows)):
+        # Only the run's own marker proves a rename. (Guessing from sidebar positions was wrong: new chats
+        # push older ones down, so another run's chat took over our row and its answer got copied.)
+        # Right after a chat switch the new title shows above the old chat's messages, so a rename counts
+        # only when the next read agrees.
+        if title and ui.title != title and shows_marker(ui, marker):
+            if maybe != ui.title:
+                maybe = ui.title
+                time.sleep(1.5)
+                continue
             log(f"Conversation renamed {title!r} -> {ui.title!r}")
             title = ui.title
-        last_rows = row_positions(ui)
+        maybe = None
         # Another chat is on screen (the user's, or another run's: chats generate in parallel). Go back to
         # ours once the window has been idle for two minutes, or after ten minutes in any case so parallel
         # runs take turns; never while a draft is open, and never in the middle of another run's step.
@@ -601,15 +626,26 @@ def wait_for_answer(win, timeout, poll, prev=None, title=None, marker=None):
 def copy_answer(win):  # caller holds the UI lock
     ui = scroll_to_bottom(win, click_ok=True)
     btn = ui.answer_copy_button() or _missing("a Copy button for an answer")
+    for _ in range(3):  # a recent click leaves it as "Copied" for a while; move off it and let it reset
+        if btn.get("label") != "Copied":
+            break
+        if ui.input:
+            hover(ui.input)
+        time.sleep(2)
+        ui = observe(win)
+        btn = ui.answer_copy_button() or btn
     pk("clipboard", "save", "--slot", "chatgpt_bridge")
     try:
         subprocess.run(["pbcopy"], input=SENTINEL, text=True, env=UTF8, check=True)
-        click(btn)
-        for _ in range(20):
-            time.sleep(0.25)
-            text = subprocess.run(["pbpaste"], capture_output=True, text=True, env=UTF8).stdout
-            if text != SENTINEL:
-                return text
+        for _ in range(2):
+            click(btn)
+            for _ in range(20):
+                time.sleep(0.25)
+                text = subprocess.run(["pbpaste"], capture_output=True, text=True, env=UTF8).stdout
+                if text != SENTINEL:
+                    return text
+            ui = scroll_to_bottom(win, click_ok=True)
+            btn = ui.answer_copy_button() or btn
         raise RuntimeError("Clicked Copy but the clipboard never changed (was the mouse or focus in use?).")
     finally:
         pk("clipboard", "restore", "--slot", "chatgpt_bridge", check=False)
@@ -819,19 +855,40 @@ def cmd_ask(args):
 
 
 def collect_answer(win, args, prev, pinned, marker=None):
-    pinned = wait_for_answer(win, args.timeout, args.poll, prev, pinned, marker)
-    log("Answer finished, copying...")
-    with ui_step("copying"):
-        ui = observe(win)
-        if pinned and ui.title != pinned and not shows_marker(ui, marker):  # another run switched the window
+    # With an explicit --marker the copied answer must contain it: copying another chat's answer (another
+    # run or the user switched the window at the wrong moment) must never end up in the output.
+    verify = bool(getattr(args, "marker", None))
+    deadline = time.time() + args.timeout
+    for _ in range(4):
+        pinned = wait_for_answer(win, max(120, deadline - time.time()), args.poll, prev, pinned, marker)
+        log("Answer finished, copying...")
+        text = None
+        with ui_step("copying"):
+            ui = observe(win)
+            if pinned and ui.title != pinned and not shows_marker(ui, marker):  # another run switched it
+                try:
+                    open_conversation(win, pinned)
+                except RuntimeError:
+                    pinned = (find_by_marker(win, marker) if marker else None) or _raise(
+                        f"Could not find the chat {pinned!r} again.")
+            if observe(win).busy:  # the chat found again is still answering
+                log("that chat is still generating; waiting for it")
+                continue
             try:
-                open_conversation(win, pinned)
-            except RuntimeError:
-                pinned = (find_by_marker(win, marker) if marker else None) or _raise(
-                    f"Could not find the chat {pinned!r} again.")
-        text = copy_answer(win)
-        title = pinned or settled_title(win)
-    return text, title
+                text = copy_answer(win)
+            except RuntimeError as e:
+                log(f"{e} Looking again.")
+            title = pinned or settled_title(win)
+        if text is not None and (not verify or marker in text):
+            return text, title
+        if text is not None:
+            log(f"the copied answer does not contain {marker!r} (another chat was on screen); looking again")
+        if marker:
+            with ui_step("finding the chat"):
+                found = find_by_marker(win, marker)
+            if found:
+                pinned = found
+    raise RuntimeError(f"Could not copy an answer containing {marker!r}; nothing was written.")
 
 
 def cmd_wait(args):

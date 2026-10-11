@@ -48,6 +48,10 @@ python3 $B usage ["Exact title"]                    # token ledger
 
 - Default to `--new-chat`. Add `--title "<unique title>"` when you may need the chat again (follow-ups,
   long runs): ChatGPT renames auto-titled chats during and after answering, and auto titles repeat.
+- For long or unattended runs also pass `--marker <unique id>`, a string that appears in the prompt and
+  that the answer will echo (e.g. a batch id). ChatGPT may replace even a title you set once the first
+  answer completes; the marker lets the run find its chat again (by its message on screen, or by copying
+  an answer and checking for the marker), and an answer that does not contain it is never written.
 - Use `--conversation TITLE` only for a conversation this skill created (the title from a previous
   `.meta.json`). It switches to that chat through the sidebar and refuses if the title does not match.
 - Every conversation has a token ledger (`~/.chatgpt-bridge/ledger.json`, deliberately high estimates of
@@ -71,7 +75,8 @@ python3 $B usage ["Exact title"]                    # token ledger
   seconds of clicking, uploading, sending, switching and copying are serialised by a lock. If the user has a
   draft in the composer, `ask` waits until it has been gone for a minute (`--idle-quiet`, `--idle-timeout`;
   `--no-wait-idle` fails at once instead). Run it in the background.
-- "is not visible in the sidebar" → the conversation scrolled out of the sidebar list; use a new chat.
+- "is not visible in the sidebar" → the conversation was renamed or scrolled out of the sidebar list. With
+  `--marker` the run searches the recent chats for it; otherwise use a new chat.
 
 ## Presenting the answer
 
