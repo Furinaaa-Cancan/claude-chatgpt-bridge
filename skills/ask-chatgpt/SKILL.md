@@ -46,7 +46,8 @@ python3 $B usage ["Exact title"]                    # token ledger
 
 ## Choosing the conversation
 
-- Default to `--new-chat`.
+- Default to `--new-chat`. Add `--title "<unique title>"` when you may need the chat again (follow-ups,
+  long runs): ChatGPT renames auto-titled chats during and after answering, and auto titles repeat.
 - Use `--conversation TITLE` only for a conversation this skill created (the title from a previous
   `.meta.json`). It switches to that chat through the sidebar and refuses if the title does not match.
 - Every conversation has a token ledger (`~/.chatgpt-bridge/ledger.json`, deliberately high estimates of
@@ -65,7 +66,10 @@ python3 $B usage ["Exact title"]                    # token ledger
 - Timeout, or the `ask` process died while ChatGPT kept working → `status`; if it is still generating, run
   `wait --conversation "<title>"` (background) to collect the reply when it finishes; if it already finished,
   `read-last`.
-- "already generating" / "draft" errors → the user is using ChatGPT; ask them to finish, then retry.
+- You never need to check whether ChatGPT is free first: `ask` waits in line behind any other bridge run
+  (from this or another Claude Code session — there is one ChatGPT window), and if ChatGPT is busy (a reply
+  being generated, a draft in the composer) it waits until it has been idle for 2 minutes before it starts
+  (`--idle-quiet`, `--idle-timeout`; `--no-wait-idle` fails at once instead). Run it in the background.
 - "is not visible in the sidebar" → the conversation scrolled out of the sidebar list; use a new chat.
 
 ## Presenting the answer

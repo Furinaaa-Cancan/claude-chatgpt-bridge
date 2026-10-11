@@ -2,7 +2,7 @@
 """Drive the ChatGPT desktop app through the Peekaboo CLI.
 
     chatgpt_bridge.py status
-    chatgpt_bridge.py ask PROMPT|- (--new-chat | --conversation TITLE) [--attach FILE]
+    chatgpt_bridge.py ask PROMPT|- (--new-chat [--title T] | --conversation TITLE) [--attach FILE]
                       [--timeout 1800] [--budget 90000] [--out answer.md]
     chatgpt_bridge.py read-last [--out answer.md]
     chatgpt_bridge.py wait --conversation TITLE [--out answer.md]   # take over a reply in progress
@@ -34,6 +34,7 @@ Lessons baked in (found by testing against ChatGPT 155.x, Peekaboo 4.2.2):
     file alone in a fresh folder, then a double-click on its icon.
 """
 import argparse
+import fcntl
 import json
 import os
 import shutil
@@ -163,17 +164,37 @@ def main_window():
     return max(std, key=lambda w: w["bounds"]["width"] * w["bounds"]["height"])["window_id"]
 
 
+_WINDOW = {}  # window id a caller holds -> ChatGPT's current window id (it recreates the window)
+
+
 def observe(win):
-    # Long waits poll thousands of times; Peekaboo occasionally fails one read ("target attribution
-    # failed"), which must not end the run.
-    for attempt in range(4):
+    """Read ChatGPT's accessibility tree, healing the two ways a long run loses it:
+    the window is recreated under a new id (reads then fail with "target attribution failed"), and
+    after a relaunch Chromium exposes no web content until a web-focus read wakes it up."""
+    for attempt in range(5):
+        wid = _WINDOW.get(win, win)
         try:
-            d = pk("see", "--app", APP, "--window-id", str(win), "--tree", "--no-screenshot", *AX_LIMITS)
-            return UI(d["data"])
+            d = pk("see", "--app", APP, "--window-id", str(wid), "--tree", "--no-screenshot", *AX_LIMITS)
+            ui = UI(d["data"])
+            if ui.one(role="AXWebArea") or attempt == 4:
+                return ui
+            wake_web_content(wid)
         except (RuntimeError, subprocess.TimeoutExpired):
-            if attempt == 3:
+            if attempt == 4:
                 raise
-            time.sleep(2 * (attempt + 1))
+            try:
+                _WINDOW[win] = main_window()
+            except RuntimeError:
+                pass
+        time.sleep(2 * (attempt + 1))
+
+
+def wake_web_content(wid):
+    shot = os.path.join(STATE_DIR, "web-focus.png")
+    os.makedirs(STATE_DIR, exist_ok=True)
+    pk("see", "--app", APP, "--window-id", str(wid), "--web-focus", "--path", shot, *AX_LIMITS, check=False)
+    if os.path.exists(shot):
+        os.remove(shot)
 
 
 def wait_for(win, pred, timeout, what, interval=0.5):
@@ -366,6 +387,31 @@ def send(win):
     click(button)
     wait_for(win, lambda ui: ui.busy or not ui.input_text, 5,
              "the prompt to leave the input box (it was not sent)")
+
+
+def rename_conversation(win, new_title):
+    """Give the open chat a title of our own: ChatGPT keeps renaming auto-titled chats while and after
+    answering, and auto titles repeat ("代码审查报告" twice), which makes a chat impossible to find again.
+    The value is written into the title field directly (typing goes through the input method)."""
+    ui = observe(win)
+    head = [e for e in ui.all(role="AXButton", label=ui.title) if e["bounds"]["y"] < ui.window_top + 45]
+    if not head:
+        raise RuntimeError("Could not find the conversation title in the window header.")
+    click(head[0])
+    for _ in range(10):
+        time.sleep(0.4)
+        ui = observe(win)
+        field = ui.one(role="AXTextField", label="Chat title")
+        if field:
+            break
+    else:
+        raise RuntimeError("Clicking the title did not open the rename field.")
+    pk("set-value", "--on", field["id"], "--snapshot", ui.snapshot, "--value", new_title, check=False)
+    time.sleep(0.3)
+    key("Return")
+    wait_for(win, lambda u: u.title == new_title, 6, f"the chat to be titled {new_title!r}")
+    log(f"Conversation renamed to {new_title!r}")
+    return new_title
 
 
 def pin_title(win, prompt):
@@ -571,6 +617,74 @@ def save_ledger(ledger):
 
 # ---------------------------------------------------------------- commands
 
+_UI_LOCK = None
+
+
+def other_bridge_runs():
+    """PIDs of other bridge processes driving ChatGPT (ask / wait / read-last), including older versions
+    of this script that do not take the lock."""
+    out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
+    pids = []
+    for line in out.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        if (pid.isdigit() and int(pid) != os.getpid() and "chatgpt_bridge.py" in cmd
+                and "python" in cmd.split(" ", 1)[0].lower()
+                and any(c in cmd for c in (" ask ", " wait ", " read-last"))):
+            pids.append(int(pid))
+    return pids
+
+
+def acquire_ui_lock():
+    """ChatGPT has one window, so only one run may drive it: runs started from other sessions queue up
+    here instead of clicking, typing and copying over each other."""
+    global _UI_LOCK
+    os.makedirs(STATE_DIR, exist_ok=True)
+    handle = open(os.path.join(STATE_DIR, "ui.lock"), "w")
+    announced = False
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            others = other_bridge_runs()
+            if not others:
+                handle.write(str(os.getpid()))
+                handle.flush()
+                if announced:
+                    log("ChatGPT is free; starting")
+                _UI_LOCK = handle  # held until the process exits
+                return handle
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        except BlockingIOError:
+            others = []
+        if not announced:
+            log(f"Another bridge run is using ChatGPT{f' (pid {others[0]})' if others else ''}; waiting in line")
+            announced = True
+        time.sleep(15)
+
+
+def wait_until_idle(win, quiet, timeout):
+    """Start only when ChatGPT is not in use: nothing generating and no draft in the composer. If it is busy
+    at first, wait until it has stayed idle on the same chat for `quiet` seconds, so the user's own
+    conversation (a reply arriving, a follow-up being typed) is never interrupted."""
+    start = time.time()
+    ui = observe(win)
+    if not ui.busy and not ui.input_text:
+        return
+    log(f"ChatGPT is in use (a reply is being generated or a draft is open); "
+        f"waiting until it has been idle for {quiet:.0f}s")
+    since, last = None, None
+    while time.time() - start < timeout:
+        time.sleep(10)
+        ui = observe(win)
+        idle = not ui.busy and not ui.input_text
+        if not idle or ui.title != last:
+            since = time.time() if idle else None
+        last = ui.title
+        if since and time.time() - since >= quiet:
+            log("ChatGPT is idle; starting")
+            return
+    raise TimeoutError(f"ChatGPT stayed busy for {timeout:.0f}s; nothing was sent.")
+
+
 def cmd_status(_args):
     win = main_window()
     ui = observe(win)
@@ -594,6 +708,7 @@ def cmd_usage(args):
 
 
 def cmd_read_last(args):
+    acquire_ui_lock()
     prev = previous_app()
     win = main_window()
     if observe(win).busy:
@@ -625,10 +740,13 @@ def cmd_ask(args):
     elif cost > args.budget:
         log(f"warning: this prompt alone is ~{cost} tokens, above the {args.budget} budget")
 
-    prev = previous_app()
+    acquire_ui_lock()
     win = main_window()
-    if observe(win).busy:
-        raise RuntimeError("ChatGPT is already generating a reply (maybe the user is using it); touching nothing.")
+    if args.wait_idle:
+        wait_until_idle(win, args.idle_quiet, args.idle_timeout)
+    elif observe(win).busy or observe(win).input_text:
+        raise RuntimeError("ChatGPT is busy (a reply is being generated or a draft is open); touching nothing.")
+    prev = previous_app()  # taken only now: the wait above can be long
     try:
         if args.new_chat:
             open_new_chat(win)
@@ -640,11 +758,16 @@ def cmd_ask(args):
         set_prompt(win, prompt)
         send(win)
         pinned = pin_title(win, prompt) if args.new_chat else args.conversation
+        if args.new_chat and args.title:
+            try:
+                pinned = rename_conversation(win, args.title)
+            except RuntimeError as e:
+                log(f"warning: could not rename the chat ({e}); following ChatGPT's own title instead")
         restore(prev)
         text, title = collect_answer(win, args, prev, pinned)
     finally:
         restore(prev)
-    record(ledger, title, cost, text, args)
+    record(title, cost, text, args)
 
 
 def collect_answer(win, args, prev, pinned):
@@ -665,16 +788,18 @@ def cmd_wait(args):
             cost += est_tokens(f.read())
     if args.attach:
         cost += min(attachment_tokens(args.attach), ATTACH_CONTEXT)
+    acquire_ui_lock()
     prev = previous_app()
     win = main_window()
     try:
         text, title = collect_answer(win, args, prev, args.conversation)
     finally:
         restore(prev)
-    record(load_ledger(), title, cost, text, args)
+    record(title, cost, text, args)
 
 
-def record(ledger, title, cost, text, args):
+def record(title, cost, text, args):
+    ledger = load_ledger()  # re-read: other runs may have written it while this one waited
     entry = ledger.setdefault(title, {"tokens": 0, "turns": 0, "created": time.strftime("%Y-%m-%dT%H:%M:%S")})
     entry["tokens"] += cost + est_tokens(text)
     entry["turns"] += 1
@@ -713,11 +838,18 @@ def main():
     target = p.add_mutually_exclusive_group(required=True)
     target.add_argument("--new-chat", action="store_true", help="start a fresh conversation")
     target.add_argument("--conversation", help="continue the conversation with this exact title")
+    p.add_argument("--title", help="with --new-chat: rename the chat to this unique title right after sending, "
+                                   "so it can be found again later")
     p.add_argument("--attach", help="file to upload with the prompt (e.g. a .zip)")
     p.add_argument("--timeout", type=float, default=1800, help="seconds to wait for the answer")
     p.add_argument("--poll", type=float, default=3, help="seconds between UI checks")
     p.add_argument("--budget", type=int, default=DEFAULT_BUDGET, help="token budget per conversation")
     p.add_argument("--out", help="write the answer here (and metadata to <out>.meta.json)")
+    p.add_argument("--no-wait-idle", dest="wait_idle", action="store_false",
+                   help="fail at once if ChatGPT is busy instead of waiting for it to be idle")
+    p.add_argument("--idle-quiet", type=float, default=120,
+                   help="when ChatGPT was busy, seconds it must stay idle before this run starts")
+    p.add_argument("--idle-timeout", type=float, default=10800, help="give up waiting for idle after this")
     p.set_defaults(fn=cmd_ask)
     p = sub.add_parser("wait", help="wait for a reply already in progress in a conversation, then copy it")
     p.add_argument("--conversation", required=True, help="exact title of the conversation")

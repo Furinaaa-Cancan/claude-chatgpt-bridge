@@ -51,9 +51,11 @@ the first upload of their code.
 
 Repeat until `next` says `"done": true`:
 
-1. `python3 $RV next --root <project>` → JSON with `part`, `zip`, `prompt`, `out`, `conversation`.
+1. `python3 $RV next --root <project>` → JSON with `part`, `zip`, `prompt`, `out`, `conversation`, `title`.
 2. Send it (Bash, `run_in_background: true`):
-   - `conversation` is null → `python3 $B ask - --new-chat --attach <zip> --timeout 10800 --poll 10 --out <out> < <prompt>`
+   - `conversation` is null → `python3 $B ask - --new-chat --title "<title>" --attach <zip> --timeout 10800 --poll 10 --out <out> < <prompt>`
+     (`--title` renames the new chat to a unique title right after sending; ChatGPT's own titles change
+     during the run and repeat across chats)
    - otherwise → same but `--conversation "<conversation>"`. On **exit code 3** (context budget):
      `python3 $RV prompt --root <project> --part <part> --handoff`, then send with `--new-chat`.
 3. While ChatGPT works (chunked mode only), verify the findings of the previous part (step 5) — only one

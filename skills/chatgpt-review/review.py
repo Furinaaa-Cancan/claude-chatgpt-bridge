@@ -436,9 +436,14 @@ def cmd_next(args):
         write_prompt(state, rnd, p, handoff=bool(meta) and not conversation)
         save(state)
     out = os.path.join(part_dir(state, rnd, p["k"]), "answer.md")
+    # A new chat gets a unique title of our own (ChatGPT's auto titles change and repeat).
+    title = None if conversation else (
+        f"review {state['name']}" + (f" p{p['k']}" if rnd["total_parts"] > 1 else "")
+        + f" #{dt.datetime.now().strftime('%m%d-%H%M')}")
     print(json.dumps({"done": False, "round": rnd["n"], "part": p["k"], "of": rnd["total_parts"],
                       "remaining": len(todo), "zip": p["zip"], "prompt": p["prompt"], "out": out,
-                      "conversation": conversation, "est_tokens": p["tokens"]}, ensure_ascii=False, indent=2))
+                      "conversation": conversation, "title": title, "est_tokens": p["tokens"]},
+                     ensure_ascii=False, indent=2))
 
 
 # ---------------------------------------------------------------- ingest / update
