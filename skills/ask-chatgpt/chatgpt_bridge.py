@@ -323,6 +323,11 @@ def find_by_marker(win, marker, limit=6):
         if shows_marker(now, marker):
             log(f"Found the run's chat by its marker: now titled {now.title!r}")
             return now.title
+        # Our message may be scrolled out of view; a finished answer that echoes the marker identifies it.
+        if not now.busy and scroll_to_bottom(win, click_ok=True).answer_copy_button() is not None:
+            if marker in copy_answer(win):
+                log(f"Found the run's chat by its answer: now titled {now.title!r}")
+                return now.title
     return None
 
 
@@ -438,10 +443,21 @@ def rename_conversation(win, new_title):
             break
     else:
         raise RuntimeError("Clicking the title did not open the rename field.")
-    pk("set-value", "--on", field["id"], "--snapshot", ui.snapshot, "--value", new_title, check=False)
-    time.sleep(0.3)
-    key("Return")
+    # Paste, not set-value: a value written straight into the field only changes what is displayed, and
+    # ChatGPT later restores its own title. Paste fires real input events (and, unlike typing, does not go
+    # through the input method).
+    key("cmd+a")
+    raise_chatgpt()
+    # Peekaboo cannot confirm a hotkey paste ("did not return a confirmed outcome") even when it worked:
+    # judge by the resulting title instead.
+    pk("paste", "--text", new_title, "--foreground", check=False)
+    time.sleep(0.4)
+    if observe(win).one(role="AXTextField", label="Chat title"):
+        key("Return")
     wait_for(win, lambda u: u.title == new_title, 6, f"the chat to be titled {new_title!r}")
+    time.sleep(3)
+    if new_title not in sidebar_titles(observe(win)) and observe(win).title != new_title:
+        raise RuntimeError(f"ChatGPT did not keep the title {new_title!r}")
     log(f"Conversation renamed to {new_title!r}")
     return new_title
 
@@ -795,7 +811,8 @@ def cmd_ask(args):
                 restore(prev)
         break
     try:
-        text, title = collect_answer(win, args, prev, pinned, os.path.basename(args.attach) if args.attach else None)
+        text, title = collect_answer(win, args, prev, pinned,
+                                     args.marker or (os.path.basename(args.attach) if args.attach else None))
     finally:
         restore(prev)
     record(title, cost, text, args)
@@ -877,6 +894,8 @@ def main():
     p.add_argument("--title", help="with --new-chat: rename the chat to this unique title right after sending, "
                                    "so it can be found again later")
     p.add_argument("--attach", help="file to upload with the prompt (e.g. a .zip)")
+    p.add_argument("--marker", help="text unique to this run that shows in its message and answer (default: the "
+                                    "attachment's file name); used to find the chat again after ChatGPT renames it")
     p.add_argument("--timeout", type=float, default=1800, help="seconds to wait for the answer")
     p.add_argument("--poll", type=float, default=3, help="seconds between UI checks")
     p.add_argument("--budget", type=int, default=DEFAULT_BUDGET, help="token budget per conversation")
