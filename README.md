@@ -110,7 +110,8 @@ python3 ~/.claude/skills/ask-chatgpt/chatgpt_bridge.py status
 
 - **上传、发送、复制结果这几秒**，ChatGPT 会被切到前台、鼠标会动一下。这时候别点鼠标或打字，否则那一步可能失败（脚本会报错停下，不会乱点）。
 - **中间的等待都在后台**，可能二三十分钟。你可以照常用电脑，甚至用 ChatGPT 的其他对话，脚本会等你空闲后再切回审查用的那个对话。
-- **不会和你抢 ChatGPT**：开始前如果 ChatGPT 正在回答别的问题、或者输入框里有你没发的草稿，它会等到空闲 2 分钟后再开始；多个 Claude Code 会话同时发起任务时，会自动排队，一个一个来。
+- **可以并行**：ChatGPT 本身能同时生成多个对话。多个任务（包括不同 Claude Code 会话发起的）各开各的对话、同时生成；只有点击、上传、发送、复制这几秒钟会互相让一下，不会抢着点。
+- **不会打断你打字**：如果输入框里有你没发的草稿，它会等草稿消失 1 分钟后再动窗口。
 - 用的是 ChatGPT 里**当前选中的模型**，审代码前记得选好 Pro。
 
 ### 报告长什么样
@@ -146,7 +147,7 @@ python3 ~/.claude/skills/ask-chatgpt/chatgpt_bridge.py status
 |---|---|
 | `status` 报 No ChatGPT window | 打开 ChatGPT 桌面版并保持窗口（可以不在前台） |
 | 权限报错，或读到的元素很少 | 确认 Peekaboo.app 在运行，`permissions status` 三项都是 Granted |
-| 日志显示 `waiting in line` / `waiting until it has been idle` | 正常：另一个任务在用 ChatGPT，或者 ChatGPT 正在回答别的问题。它会自动排队，等前面的任务结束、ChatGPT 空闲 2 分钟后再开始，不会打断你 |
+| 日志显示 `another run is using the ChatGPT window` / `a draft is open` | 正常：另一个任务正在点击或复制（几秒钟），或者你的输入框里有草稿。它会等一下再继续，不会打断 |
 | `Clicked Copy but the clipboard never changed` | 复制那一刻鼠标或焦点被占用了；等一下再 `read-last` |
 | 超时，或进程中途退出 | 先 `status`。还在生成就用 `wait --conversation "标题"` 接管；已经答完就用 `read-last` |
 | `is not visible in the sidebar` | 要续问的对话不在侧边栏可见范围内，改用新对话 |

@@ -66,10 +66,11 @@ python3 $B usage ["Exact title"]                    # token ledger
 - Timeout, or the `ask` process died while ChatGPT kept working → `status`; if it is still generating, run
   `wait --conversation "<title>"` (background) to collect the reply when it finishes; if it already finished,
   `read-last`.
-- You never need to check whether ChatGPT is free first: `ask` waits in line behind any other bridge run
-  (from this or another Claude Code session — there is one ChatGPT window), and if ChatGPT is busy (a reply
-  being generated, a draft in the composer) it waits until it has been idle for 2 minutes before it starts
-  (`--idle-quiet`, `--idle-timeout`; `--no-wait-idle` fails at once instead). Run it in the background.
+- You never need to check whether ChatGPT is free first. ChatGPT generates several chats in parallel, so
+  runs (from this or other Claude Code sessions) each use their own chat and wait in parallel; only the few
+  seconds of clicking, uploading, sending, switching and copying are serialised by a lock. If the user has a
+  draft in the composer, `ask` waits until it has been gone for a minute (`--idle-quiet`, `--idle-timeout`;
+  `--no-wait-idle` fails at once instead). Run it in the background.
 - "is not visible in the sidebar" → the conversation scrolled out of the sidebar list; use a new chat.
 
 ## Presenting the answer
