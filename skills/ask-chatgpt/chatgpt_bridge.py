@@ -103,8 +103,12 @@ class UI:
 
     @property
     def title(self):
-        area = self.one(role="AXWebArea")
-        return (area.get("label") or "") if area else ""
+        # The main conversation is the largest web area; side panels (tabs such as "Home") are smaller.
+        areas = self.all(role="AXWebArea")
+        if not areas:
+            return ""
+        main = max(areas, key=lambda a: a["bounds"]["width"] * a["bounds"]["height"])
+        return main.get("label") or ""
 
     @property
     def window_top(self):
@@ -273,7 +277,7 @@ def open_conversation(win, title):
     ui = observe(win)
     if ui.title == title:
         return
-    rows = [e for e in ui.all(role="AXButton", label=title) if e["bounds"]["y"] > ui.window_top + 50]
+    rows = [e for e in conversation_rows(ui) if e.get("label") == title]
     if len(rows) != 1:
         problem = "is not visible in the sidebar" if not rows else "matches several sidebar entries"
         raise RuntimeError(f"Conversation {title!r} {problem}; not sending.")
@@ -391,13 +395,42 @@ def pin_title(win, prompt):
     return None
 
 
+def conversation_rows(ui):
+    """Sidebar rows that are conversations: each has its own "Chat actions" menu on the same row.
+
+    Navigation buttons (Home, Plugins, …), New chat and project folders have none, so a page called
+    "Home" can never be mistaken for a conversation.
+    """
+    menus = [m["bounds"] for m in ui.all(label="Chat actions")]
+
+    def owns(row, m):  # the menu sits inside the row, at its right end
+        r = row["bounds"]
+        return (abs(r["y"] + r["height"] / 2 - (m["y"] + m["height"] / 2)) < 10
+                and r["x"] <= m["x"] <= r["x"] + r["width"] and r["width"] > 3 * m["width"])
+
+    return [e for e in ui.all(role="AXButton")
+            if e.get("label") and e.get("label") != "Chat actions" and any(owns(e, m) for m in menus)]
+
+
 def sidebar_titles(ui):
-    return {e.get("label") for e in ui.all(role="AXButton") if e["bounds"]["y"] > ui.window_top + 50}
+    return {e.get("label") for e in conversation_rows(ui)}
 
 
-def renamed(ui, old_title):
-    titles = sidebar_titles(ui)
-    return ui.title not in ("", NEW_CHAT_TITLE) and old_title not in titles and ui.title in titles
+def row_positions(ui):
+    return {e["label"]: (e["bounds"]["x"], e["bounds"]["y"]) for e in conversation_rows(ui)}
+
+
+def renamed(ui, old_title, last_rows):
+    """ChatGPT renames a chat in place: the sidebar row that showed the old title now shows the new one.
+
+    Navigating elsewhere never changes a row's label, and the sidebar may be scrolled or partly hidden,
+    so only that same-row evidence counts.
+    """
+    pos = (last_rows or {}).get(old_title)
+    if not pos or ui.title in ("", NEW_CHAT_TITLE):
+        return False
+    return any(abs(x - pos[0]) < 6 and abs(y - pos[1]) < 6 and label == ui.title
+               for label, (x, y) in row_positions(ui).items())
 
 
 def wait_for_answer(win, timeout, poll, prev=None, title=None):
@@ -406,14 +439,15 @@ def wait_for_answer(win, timeout, poll, prev=None, title=None):
     seen_busy = False
     stable = 0
     away = None
+    last_rows = None
     while time.time() - start < timeout:
         time.sleep(poll)
         ui = observe(win)
         # ChatGPT renames a chat while and after answering (seen: prompt text -> "X_request" -> "X发现").
-        # If the old title is gone from the sidebar and the shown one is listed, it is our chat, renamed.
-        if title and ui.title != title and renamed(ui, title):
+        if title and ui.title != title and renamed(ui, title, last_rows):
             log(f"Conversation renamed {title!r} -> {ui.title!r}")
             title = ui.title
+        last_rows = row_positions(ui)
         # The user may open other chats during a long run. Their state says nothing about ours, so wait;
         # once ChatGPT has been idle for two minutes, go back to our conversation.
         if title and ui.title != title:
@@ -421,9 +455,12 @@ def wait_for_answer(win, timeout, poll, prev=None, title=None):
                 away = time.time()
                 log(f"ChatGPT is showing {ui.title!r}; waiting before switching back to {title!r}")
             elif not ui.busy and not ui.input_text and time.time() - away > 120:
-                open_conversation(win, title)
+                try:
+                    open_conversation(win, title)
+                except RuntimeError as e:  # e.g. scrolled out of the sidebar; keep waiting, never click blind
+                    log(f"{e} Still waiting; open it in ChatGPT to let the run finish.")
                 restore(prev)
-                away = None
+                away = time.time()
             continue
         away = None
         # For tasks that read files ChatGPT may offer "Continue in ChatGPT Work" with a countdown;
@@ -614,8 +651,6 @@ def collect_answer(win, args, prev, pinned):
     pinned = wait_for_answer(win, args.timeout, args.poll, prev, pinned)
     log("Answer finished, copying...")
     ui = observe(win)
-    if pinned and ui.title != pinned and renamed(ui, pinned):
-        pinned = ui.title
     if pinned and ui.title != pinned:
         open_conversation(win, pinned)
     text = copy_answer(win)
