@@ -262,14 +262,15 @@ def type_text(text):
     pk("type", text, "--foreground")
 
 
-def scroll_to_bottom(win):
+def scroll_to_bottom(win, click_ok=False):
+    """Bring the end of the answer (its action bar) on screen. Background wheel scrolling first; some layouts
+    (e.g. with the agent side panel) ignore it, so with click_ok — only while holding the UI lock — fall
+    back to clicking ChatGPT's own "Scroll to bottom" button."""
     ui = observe(win)
-    # A review answer can be very long (a 20-minute run produced tens of KB), so allow many large steps.
-    for _ in range(40):
+    for _ in range(3):
         button = ui.one(role="AXButton", label="Scroll to bottom")
-        if not button:
+        if ui.answer_copy_button() is not None or not button:
             return ui
-        # Scroll the area that holds the chat: the smallest one containing the "Scroll to bottom" button.
         bx = button["bounds"]["x"] + button["bounds"]["width"] / 2
         by = button["bounds"]["y"] + button["bounds"]["height"] / 2
         areas = [a for a in ui.all(role="AXScrollArea")
@@ -282,6 +283,11 @@ def scroll_to_bottom(win):
            check=False)
         time.sleep(0.4)
         ui = observe(win)
+    button = ui.one(role="AXButton", label="Scroll to bottom")
+    if click_ok and button and ui.answer_copy_button() is None:
+        click(button)
+        time.sleep(1.5)
+        ui = observe(win)
     return ui
 
 
@@ -293,6 +299,31 @@ def open_new_chat(win):
     # land in whatever chat the user had open.
     wait_for(win, lambda ui: ui.title == NEW_CHAT_TITLE and not ui.has_messages and ui.input, 10,
              "an empty new chat")
+
+
+def shows_marker(ui, marker):
+    """Our message is on screen: the latest user message stays pinned at the top of the chat, with its
+    attachment chip (a unique file name per run) and text."""
+    if not marker:
+        return False
+    return any(marker in (e.get("label") or "") or marker in str(e.get("value") or "") for e in ui.els)
+
+
+def find_by_marker(win, marker, limit=6):
+    """ChatGPT also renames chats that we titled ourselves, so a title can vanish from the sidebar. Open the
+    most recent chats one by one and recognise ours by its marker; returns its current title or None."""
+    ui = observe(win)
+    recents = [e for e in ui.all(role="AXButton", label="Recents")]
+    top = recents[0]["bounds"]["y"] if recents else ui.window_top + 50
+    rows = sorted((e for e in conversation_rows(ui) if e["bounds"]["y"] > top), key=lambda e: e["bounds"]["y"])
+    for row in rows[:limit]:
+        click(row)
+        time.sleep(1.5)
+        now = observe(win)
+        if shows_marker(now, marker):
+            log(f"Found the run's chat by its marker: now titled {now.title!r}")
+            return now.title
+    return None
 
 
 def open_conversation(win, title):
@@ -480,7 +511,7 @@ def renamed(ui, old_title, last_rows):
                for label, (x, y) in row_positions(ui).items())
 
 
-def wait_for_answer(win, timeout, poll, prev=None, title=None):
+def wait_for_answer(win, timeout, poll, prev=None, title=None, marker=None):
     """Return once the reply is complete; returns the conversation title (ChatGPT may rename it)."""
     start = time.time()
     seen_busy = False
@@ -491,7 +522,7 @@ def wait_for_answer(win, timeout, poll, prev=None, title=None):
         time.sleep(poll)
         ui = observe(win)
         # ChatGPT renames a chat while and after answering (seen: prompt text -> "X_request" -> "X发现").
-        if title and ui.title != title and renamed(ui, title, last_rows):
+        if title and ui.title != title and (shows_marker(ui, marker) or renamed(ui, title, last_rows)):
             log(f"Conversation renamed {title!r} -> {ui.title!r}")
             title = ui.title
         last_rows = row_positions(ui)
@@ -508,8 +539,12 @@ def wait_for_answer(win, timeout, poll, prev=None, title=None):
                     if now.title != title and not now.input_text:
                         try:
                             open_conversation(win, title)
-                        except RuntimeError as e:  # e.g. scrolled out of the sidebar; never click blind
-                            log(f"{e} Still waiting; open it in ChatGPT to let the run finish.")
+                        except RuntimeError as e:  # renamed out of sight, or scrolled out of the sidebar
+                            found = find_by_marker(win, marker) if marker else None
+                            if found:
+                                title = found
+                            else:
+                                log(f"{e} Still waiting; open it in ChatGPT to let the run finish.")
                 restore(prev)
                 away = time.time()
             continue
@@ -533,6 +568,10 @@ def wait_for_answer(win, timeout, poll, prev=None, title=None):
             continue
         if ui.answer_copy_button() is None and ui.one(role="AXButton", label="Scroll to bottom"):
             ui = scroll_to_bottom(win)
+            if ui.answer_copy_button() is None and not ui.busy:
+                with ui_step("scrolling to the end of the answer"):
+                    if observe(win).title == title or not title:
+                        ui = scroll_to_bottom(win, click_ok=True)
         ready = ui.answer_copy_button() is not None and not ui.input_text
         if ready and (seen_busy or time.time() - start > 20):
             stable += 1
@@ -543,8 +582,8 @@ def wait_for_answer(win, timeout, poll, prev=None, title=None):
     raise TimeoutError(f"No finished answer after {timeout}s (it may still be generating; use read-last later).")
 
 
-def copy_answer(win):
-    ui = scroll_to_bottom(win)
+def copy_answer(win):  # caller holds the UI lock
+    ui = scroll_to_bottom(win, click_ok=True)
     btn = ui.answer_copy_button() or _missing("a Copy button for an answer")
     pk("clipboard", "save", "--slot", "chatgpt_bridge")
     try:
@@ -569,6 +608,10 @@ def settled_title(win):
         title = f"untitled-{time.strftime('%Y%m%d-%H%M%S')}"
         log(f"ChatGPT did not title the conversation; recording it as {title!r}")
         return title
+
+
+def _raise(msg):
+    raise RuntimeError(msg)
 
 
 def _missing(what):
@@ -752,19 +795,23 @@ def cmd_ask(args):
                 restore(prev)
         break
     try:
-        text, title = collect_answer(win, args, prev, pinned)
+        text, title = collect_answer(win, args, prev, pinned, os.path.basename(args.attach) if args.attach else None)
     finally:
         restore(prev)
     record(title, cost, text, args)
 
 
-def collect_answer(win, args, prev, pinned):
-    pinned = wait_for_answer(win, args.timeout, args.poll, prev, pinned)
+def collect_answer(win, args, prev, pinned, marker=None):
+    pinned = wait_for_answer(win, args.timeout, args.poll, prev, pinned, marker)
     log("Answer finished, copying...")
     with ui_step("copying"):
         ui = observe(win)
-        if pinned and ui.title != pinned:  # another run switched the window meanwhile
-            open_conversation(win, pinned)
+        if pinned and ui.title != pinned and not shows_marker(ui, marker):  # another run switched the window
+            try:
+                open_conversation(win, pinned)
+            except RuntimeError:
+                pinned = (find_by_marker(win, marker) if marker else None) or _raise(
+                    f"Could not find the chat {pinned!r} again.")
         text = copy_answer(win)
         title = pinned or settled_title(win)
     return text, title
@@ -781,7 +828,7 @@ def cmd_wait(args):
     prev = previous_app()
     win = main_window()
     try:
-        text, title = collect_answer(win, args, prev, args.conversation)
+        text, title = collect_answer(win, args, prev, args.conversation, args.marker)
     finally:
         restore(prev)
     record(title, cost, text, args)
@@ -841,6 +888,8 @@ def main():
     p.add_argument("--idle-timeout", type=float, default=10800, help="give up waiting after this")
     p.set_defaults(fn=cmd_ask)
     p = sub.add_parser("wait", help="wait for a reply already in progress in a conversation, then copy it")
+    p.add_argument("--marker", help="text unique to the run's message (e.g. its attachment file name), used to "
+                                    "recognise the chat after ChatGPT renamed it")
     p.add_argument("--conversation", required=True, help="exact title of the conversation")
     p.add_argument("--prompt-file", help="the prompt that was sent (for the token ledger)")
     p.add_argument("--attach", help="the file that was attached (for the token ledger)")
