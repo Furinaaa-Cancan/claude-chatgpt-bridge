@@ -160,8 +160,16 @@ def main_window():
 
 
 def observe(win):
-    d = pk("see", "--app", APP, "--window-id", str(win), "--tree", "--no-screenshot", *AX_LIMITS)
-    return UI(d["data"])
+    # Long waits poll thousands of times; Peekaboo occasionally fails one read ("target attribution
+    # failed"), which must not end the run.
+    for attempt in range(4):
+        try:
+            d = pk("see", "--app", APP, "--window-id", str(win), "--tree", "--no-screenshot", *AX_LIMITS)
+            return UI(d["data"])
+        except (RuntimeError, subprocess.TimeoutExpired):
+            if attempt == 3:
+                raise
+            time.sleep(2 * (attempt + 1))
 
 
 def wait_for(win, pred, timeout, what, interval=0.5):
@@ -230,13 +238,21 @@ def type_text(text):
 
 def scroll_to_bottom(win):
     ui = observe(win)
-    for _ in range(15):
-        if not ui.one(role="AXButton", label="Scroll to bottom"):
+    # A review answer can be very long (a 20-minute run produced tens of KB), so allow many large steps.
+    for _ in range(40):
+        button = ui.one(role="AXButton", label="Scroll to bottom")
+        if not button:
             return ui
-        area = ui.one(role="AXScrollArea")
-        if not area:
+        # Scroll the area that holds the chat: the smallest one containing the "Scroll to bottom" button.
+        bx = button["bounds"]["x"] + button["bounds"]["width"] / 2
+        by = button["bounds"]["y"] + button["bounds"]["height"] / 2
+        areas = [a for a in ui.all(role="AXScrollArea")
+                 if a["bounds"]["x"] <= bx <= a["bounds"]["x"] + a["bounds"]["width"]
+                 and a["bounds"]["y"] <= by <= a["bounds"]["y"] + a["bounds"]["height"]]
+        if not areas:
             break
-        pk("scroll", "--direction", "down", "--amount", "60", "--on", area["id"], "--snapshot", ui.snapshot,
+        area = min(areas, key=lambda a: a["bounds"]["width"] * a["bounds"]["height"])
+        pk("scroll", "--direction", "down", "--amount", "80", "--on", area["id"], "--snapshot", ui.snapshot,
            check=False)
         time.sleep(0.4)
         ui = observe(win)
@@ -375,7 +391,17 @@ def pin_title(win, prompt):
     return None
 
 
+def sidebar_titles(ui):
+    return {e.get("label") for e in ui.all(role="AXButton") if e["bounds"]["y"] > ui.window_top + 50}
+
+
+def renamed(ui, old_title):
+    titles = sidebar_titles(ui)
+    return ui.title not in ("", NEW_CHAT_TITLE) and old_title not in titles and ui.title in titles
+
+
 def wait_for_answer(win, timeout, poll, prev=None, title=None):
+    """Return once the reply is complete; returns the conversation title (ChatGPT may rename it)."""
     start = time.time()
     seen_busy = False
     stable = 0
@@ -383,6 +409,11 @@ def wait_for_answer(win, timeout, poll, prev=None, title=None):
     while time.time() - start < timeout:
         time.sleep(poll)
         ui = observe(win)
+        # ChatGPT renames a chat while and after answering (seen: prompt text -> "X_request" -> "X发现").
+        # If the old title is gone from the sidebar and the shown one is listed, it is our chat, renamed.
+        if title and ui.title != title and renamed(ui, title):
+            log(f"Conversation renamed {title!r} -> {ui.title!r}")
+            title = ui.title
         # The user may open other chats during a long run. Their state says nothing about ours, so wait;
         # once ChatGPT has been idle for two minutes, go back to our conversation.
         if title and ui.title != title:
@@ -417,7 +448,7 @@ def wait_for_answer(win, timeout, poll, prev=None, title=None):
         if ready and (seen_busy or time.time() - start > 20):
             stable += 1
             if stable >= 2:
-                return
+                return title
         else:
             stable = 0
     raise TimeoutError(f"No finished answer after {timeout}s (it may still be generating; use read-last later).")
@@ -580,9 +611,12 @@ def cmd_ask(args):
 
 
 def collect_answer(win, args, prev, pinned):
-    wait_for_answer(win, args.timeout, args.poll, prev, pinned)
+    pinned = wait_for_answer(win, args.timeout, args.poll, prev, pinned)
     log("Answer finished, copying...")
-    if pinned and observe(win).title != pinned:
+    ui = observe(win)
+    if pinned and ui.title != pinned and renamed(ui, pinned):
+        pinned = ui.title
+    if pinned and ui.title != pinned:
         open_conversation(win, pinned)
     text = copy_answer(win)
     return text, pinned or settled_title(win)
