@@ -53,6 +53,10 @@ UTF8 = {**os.environ, "LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"}
 SENTINEL = "__chatgpt_bridge_sentinel__"
 STATE_DIR = os.path.expanduser("~/.chatgpt-bridge")
 LEDGER = os.path.join(STATE_DIR, "ledger.json")
+STOP_FILE = os.path.join(STATE_DIR, "STOP")  # the off switch, shared by every run in every session
+LAST_INPUT = os.path.join(STATE_DIR, "last-input")  # when a run last clicked or typed
+# Commands that move the mouse, press keys or change the window; reading the screen ("see") does not.
+UI_ACTIONS = {"click", "press", "type", "paste", "scroll", "move", "set-value", "drag", "hotkey"}
 NEW_CHAT_TITLE = "ChatGPT"
 # Thinking mode is documented at 128K input tokens; stay well below it because hidden
 # reasoning, tool output and file reads also take space.
@@ -68,9 +72,54 @@ def log(msg):
     print(f"[bridge] {msg}", file=sys.stderr, flush=True)
 
 
+class Stopped(Exception):
+    pass
+
+
+def check_stop():
+    """`chatgpt_bridge.py stop` creates the switch file; every run, in any session, then stops before its next
+    click or key press and waiting runs end at their next check. `resume` removes it."""
+    if os.path.exists(STOP_FILE):
+        raise Stopped("the bridge is switched off (run `chatgpt_bridge.py resume` to switch it back on)")
+
+
+def user_idle_seconds():
+    out = subprocess.run(["ioreg", "-c", "IOHIDSystem"], capture_output=True, text=True).stdout
+    m = re.search(r'"HIDIdleTime" = (\d+)', out)
+    return int(m.group(1)) / 1e9 if m else float("inf")
+
+
+def wait_until_user_away():
+    """With CHATGPT_BRIDGE_USER_IDLE=N (unattended runs), touch the screen only after nobody has used the mouse
+    or keyboard for N seconds, so a run never takes over a computer someone is using. Input from the runs
+    themselves (recorded in LAST_INPUT) does not count as someone using it."""
+    need = float(os.environ.get("CHATGPT_BRIDGE_USER_IDLE") or 0)
+    announced = False
+    while need:
+        check_stop()
+        idle = user_idle_seconds()
+        try:
+            ours = time.time() - os.path.getmtime(LAST_INPUT)
+        except OSError:
+            ours = float("inf")
+        if idle >= need or abs(ours - idle) < 3:
+            return
+        if not announced:
+            log(f"someone is using the computer; waiting until it has been idle for {need:.0f}s")
+            announced = True
+        time.sleep(5)
+
+
 def pk(*args, check=True, timeout=60):
+    if args and args[0] in UI_ACTIONS:
+        check_stop()
+        wait_until_user_away()
     cmd = ["peekaboo", *args, "--bridge-socket", BRIDGE, "--json"]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=UTF8)
+    if args and args[0] in UI_ACTIONS:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(LAST_INPUT, "w") as f:
+            f.write(str(time.time()))
     try:
         d = json.loads(p.stdout)
     except json.JSONDecodeError:
@@ -233,6 +282,8 @@ def restore(prev):
 
 
 def raise_chatgpt():
+    check_stop()
+    wait_until_user_away()
     for _ in range(10):
         subprocess.run(["open", "-b", BUNDLE])
         time.sleep(0.3)
@@ -569,6 +620,7 @@ def wait_for_answer(win, timeout, poll, prev=None, title=None, marker=None):
     maybe = None  # a new title seen once with our marker on screen
     while time.time() - start < timeout:
         time.sleep(poll)
+        check_stop()
         ui = observe(win)
         # ChatGPT renames a chat while and after answering (seen: prompt text -> "X_request" -> "X发现").
         # Only the run's own marker proves a rename. (Guessing from sidebar positions was wrong: new chats
@@ -774,6 +826,7 @@ def ui_step(what):
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
+                check_stop()
                 if not announced and time.time() - start > 5:
                     log(f"another run is using the ChatGPT window; {what} waits for it")
                     announced = True
@@ -801,6 +854,19 @@ def wait_for_no_draft(win, quiet, timeout):
             if time.time() - since >= quiet:
                 return
     raise TimeoutError(f"A draft stayed open in ChatGPT for {timeout:.0f}s; nothing was sent.")
+
+
+def cmd_stop(_args):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(STOP_FILE, "w") as f:
+        f.write(time.strftime("%Y-%m-%dT%H:%M:%S"))
+    print(f"bridge switched off ({STOP_FILE}); runs stop before their next click. `resume` switches it on.")
+
+
+def cmd_resume(_args):
+    if os.path.exists(STOP_FILE):
+        os.remove(STOP_FILE)
+    print("bridge switched on")
 
 
 def cmd_status(_args):
@@ -981,6 +1047,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status").set_defaults(fn=cmd_status)
+    sub.add_parser("stop", help="switch the bridge off: every run in every session stops touching the screen"
+                   ).set_defaults(fn=cmd_stop)
+    sub.add_parser("resume", help="switch the bridge back on").set_defaults(fn=cmd_resume)
     p = sub.add_parser("usage")
     p.add_argument("title", nargs="?")
     p.set_defaults(fn=cmd_usage)
@@ -1020,10 +1089,15 @@ def main():
     p.set_defaults(fn=cmd_wait)
     args = ap.parse_args()
     try:
+        if args.cmd not in ("stop", "resume", "usage"):
+            check_stop()  # switched off: do not even read the screen (that would start Peekaboo again)
         args.fn(args)
     except BudgetExceeded as e:
         print(f"budget: {e}", file=sys.stderr)
         sys.exit(3)
+    except Stopped as e:
+        print(f"stopped: {e}", file=sys.stderr)
+        sys.exit(5)
     except (RuntimeError, TimeoutError) as e:
         sys.exit(f"error: {e}")
 

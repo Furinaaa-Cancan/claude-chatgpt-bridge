@@ -61,6 +61,15 @@ python3 $B usage ["Exact title"]                    # token ledger
   **Exit code 3** means the follow-up would exceed it: start a `--new-chat` instead and include a handoff
   summary of everything the new chat needs to know.
 
+## Switching it off
+
+- `python3 $B stop` switches the bridge off for every run in every session: runs stop before their next
+  click or key press, waiting runs end at their next check, and new commands exit with code 5 without even
+  reading the screen. `python3 $B resume` switches it back on. Use `stop` whenever the user wants the
+  screen back; do not hunt for processes.
+- Unattended runs set `CHATGPT_BRIDGE_USER_IDLE=120`: the bridge then touches the screen only after nobody
+  has used the mouse or keyboard for two minutes (its own clicks do not count).
+
 ## When something fails
 
 - **Never resend automatically.** A failed run may still have sent the message; resending duplicates it.
