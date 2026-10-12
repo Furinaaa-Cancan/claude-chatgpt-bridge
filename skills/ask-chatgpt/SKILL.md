@@ -61,14 +61,21 @@ python3 $B usage ["Exact title"]                    # token ledger
   **Exit code 3** means the follow-up would exceed it: start a `--new-chat` instead and include a handoff
   summary of everything the new chat needs to know.
 
-## Switching it off
+## Switching it off, and what is running
 
+- `python3 $B status` shows whether the bridge is switched on, whether Peekaboo is running, and every run
+  that is using the screen (from any session: pid, command, what it is for, since when). It never starts
+  Peekaboo just to look.
 - `python3 $B stop` switches the bridge off for every run in every session: runs stop before their next
-  click or key press, waiting runs end at their next check, and new commands exit with code 5 without even
-  reading the screen. `python3 $B resume` switches it back on. Use `stop` whenever the user wants the
-  screen back; do not hunt for processes.
-- Unattended runs set `CHATGPT_BRIDGE_USER_IDLE=120`: the bridge then touches the screen only after nobody
-  has used the mouse or keyboard for two minutes (its own clicks do not count).
+  click or key press and waiting runs end at their next check. It then waits until every registered run
+  has really ended and quits Peekaboo; anything still alive is listed (`stop --force` ends it). While
+  switched off, commands exit with code 5 without touching the screen. `python3 $B resume` switches it
+  back on. When the user wants the screen back, use `stop`; do not hunt for processes.
+- Runs start Peekaboo.app only when they need the screen and quit it when the last run that needed it ends.
+- Runs click or type only after the mouse and keyboard have been idle for `CHATGPT_BRIDGE_USER_IDLE` seconds
+  (default 30, unattended runs 120, 0 turns it off); their own input does not count.
+- A run that cannot find its chat gives up after 3 searches. Searching only looks at other chats (and
+  scrolls up to the run's own message); it never copies another chat's answer.
 
 ## When something fails
 

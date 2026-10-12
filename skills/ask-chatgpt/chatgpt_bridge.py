@@ -7,9 +7,16 @@
     chatgpt_bridge.py read-last [--out answer.md]
     chatgpt_bridge.py wait --conversation TITLE [--out answer.md]   # take over a reply in progress
     chatgpt_bridge.py usage [TITLE]
+    chatgpt_bridge.py stop [--force] [--keep-peekaboo]   # switch off: every run stops, Peekaboo quits
+    chatgpt_bridge.py resume                              # switch back on
 
 Exit codes: 0 ok, 1 error, 3 the conversation's context budget would be exceeded
-(start a new chat and hand the relevant context over in the prompt).
+(start a new chat and hand the relevant context over in the prompt), 5 switched off.
+
+Control: every run that uses the screen registers in ~/.chatgpt-bridge/runs/ (`status` lists them),
+starts Peekaboo.app only when it is needed and quits it when the last run that needed it ends, waits
+until the mouse and keyboard have been idle (CHATGPT_BRIDGE_USER_IDLE seconds, default 30) before it
+clicks or types, and gives up after a bounded search instead of looping.
 
 Every conversation gets a ledger entry (~/.chatgpt-bridge/ledger.json) with a deliberately
 high token estimate of everything sent and received, so follow-ups can stop before the
@@ -40,6 +47,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -57,6 +65,11 @@ STOP_FILE = os.path.join(STATE_DIR, "STOP")  # the off switch, shared by every r
 LAST_INPUT = os.path.join(STATE_DIR, "last-input")  # when a run last clicked or typed
 # Commands that move the mouse, press keys or change the window; reading the screen ("see") does not.
 UI_ACTIONS = {"click", "press", "type", "paste", "scroll", "move", "set-value", "drag", "hotkey"}
+RUNS_DIR = os.path.join(STATE_DIR, "runs")  # one file per live run: who is using the screen and why
+STARTED_PEEKABOO = os.path.join(STATE_DIR, "peekaboo-started-by-bridge")
+SCREEN_COMMANDS = {"ask", "wait", "read-last"}
+MAX_SEARCHES = 3  # a run that cannot find its chat gives up after this many searches
+USER_IDLE_DEFAULT = "30"
 NEW_CHAT_TITLE = "ChatGPT"
 # Thinking mode is documented at 128K input tokens; stay well below it because hidden
 # reasoning, tool output and file reads also take space.
@@ -90,10 +103,10 @@ def user_idle_seconds():
 
 
 def wait_until_user_away():
-    """With CHATGPT_BRIDGE_USER_IDLE=N (unattended runs), touch the screen only after nobody has used the mouse
-    or keyboard for N seconds, so a run never takes over a computer someone is using. Input from the runs
-    themselves (recorded in LAST_INPUT) does not count as someone using it."""
-    need = float(os.environ.get("CHATGPT_BRIDGE_USER_IDLE") or 0)
+    """Touch the screen only after nobody has used the mouse or keyboard for CHATGPT_BRIDGE_USER_IDLE seconds
+    (default 30; unattended runs use more, 0 turns it off), so a run never takes over a computer someone is
+    using. Input from the runs themselves (recorded in LAST_INPUT) does not count as someone using it."""
+    need = float(os.environ.get("CHATGPT_BRIDGE_USER_IDLE", USER_IDLE_DEFAULT) or 0)
     announced = False
     while need:
         check_stop()
@@ -108,6 +121,85 @@ def wait_until_user_away():
             log(f"someone is using the computer; waiting until it has been idle for {need:.0f}s")
             announced = True
         time.sleep(5)
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def active_runs(exclude=None):
+    """Registered runs whose process is alive; entries left by dead processes are removed."""
+    runs = []
+    for name in sorted(os.listdir(RUNS_DIR)) if os.path.isdir(RUNS_DIR) else []:
+        path = os.path.join(RUNS_DIR, name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                run = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not _alive(run.get("pid", -1)):
+            with contextlib.suppress(OSError):
+                os.remove(path)
+        elif run.get("pid") != exclude:
+            runs.append(run)
+    return runs
+
+
+def peekaboo_running():
+    return subprocess.run(["pgrep", "-x", "Peekaboo"], capture_output=True).returncode == 0
+
+
+def start_peekaboo():
+    """Peekaboo.app holds the Accessibility and Screen Recording grants; start it in the background only when
+    a run needs the screen, and remember that the bridge started it."""
+    if peekaboo_running():
+        return
+    log("starting Peekaboo")
+    subprocess.run(["open", "-g", "-a", "Peekaboo"], check=True)
+    with open(STARTED_PEEKABOO, "w") as f:
+        f.write(time.strftime("%Y-%m-%dT%H:%M:%S"))
+    for _ in range(40):
+        time.sleep(0.5)
+        if pk("window", "list", "--app", APP, check=False).get("success"):
+            return
+    raise RuntimeError("Peekaboo did not start (check its Accessibility and Screen Recording permissions).")
+
+
+def quit_peekaboo(only_if_ours=True):
+    """Quit Peekaboo.app when no run needs it. Checked first: telling an app that is not running to quit
+    would launch it."""
+    if only_if_ours and not os.path.exists(STARTED_PEEKABOO):
+        return
+    if peekaboo_running():
+        subprocess.run(["osascript", "-e", 'tell application "Peekaboo" to quit'], capture_output=True)
+    with contextlib.suppress(OSError):
+        os.remove(STARTED_PEEKABOO)
+
+
+@contextlib.contextmanager
+def registered(args):
+    """Register this run while it may use the screen, so `status` and `stop` know about it."""
+    os.makedirs(RUNS_DIR, exist_ok=True)
+    path = os.path.join(RUNS_DIR, f"{os.getpid()}.json")
+    what = getattr(args, "marker", None) or getattr(args, "title", None) or getattr(args, "conversation", None) \
+        or (os.path.basename(args.attach) if getattr(args, "attach", None) else None)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"pid": os.getpid(), "command": args.cmd, "what": what, "cwd": os.getcwd(),
+                   "started": time.strftime("%Y-%m-%dT%H:%M:%S")}, f, ensure_ascii=False)
+    try:
+        start_peekaboo()
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(path)
+        if not active_runs(exclude=os.getpid()):
+            quit_peekaboo()
 
 
 def pk(*args, check=True, timeout=60):
@@ -372,10 +464,43 @@ def shows_marker(ui, marker):
     return False
 
 
+_SEARCHES = 0
+
+
+def conversation_area(ui):
+    """The scroll area of the open conversation (the widest one right of the sidebar)."""
+    edge = max((r["bounds"]["x"] + r["bounds"]["width"] for r in conversation_rows(ui)), default=0)
+    areas = [a for a in ui.all(role="AXScrollArea") if a["bounds"]["x"] + a["bounds"]["width"] / 2 > edge]
+    return max(areas, key=lambda a: a["bounds"]["width"] * a["bounds"]["height"]) if areas else None
+
+
+def marker_in_chat(win, marker):
+    """Look for the marker in the open chat: on screen, else scroll up to our message at the start of the
+    conversation (the prompt names the marker in its first lines). Reads the screen only; copies nothing."""
+    for _ in range(5):
+        ui = observe(win)
+        if shows_marker(ui, marker):
+            return ui
+        area = conversation_area(ui)
+        if area is None:
+            return None
+        pk("scroll", "--direction", "up", "--amount", "150", "--on", area["id"], "--snapshot", ui.snapshot,
+           check=False)
+        time.sleep(0.6)
+    ui = observe(win)
+    return ui if shows_marker(ui, marker) else None
+
+
 def find_by_marker(win, marker, limit=6):
     """ChatGPT resets a chat's title when its first answer completes (overwriting a title we set while it was
     still generating), so a title can vanish from the sidebar. Open the most recent chats one by one and
-    recognise ours by its marker; returns its current title or None."""
+    recognise ours by its marker; returns its current title or None. Other chats are only looked at, never
+    copied, and a run searches at most MAX_SEARCHES times."""
+    global _SEARCHES
+    _SEARCHES += 1
+    if _SEARCHES > MAX_SEARCHES:
+        raise RuntimeError(f"Could not find the run's chat ({marker!r}) after {MAX_SEARCHES} searches; nothing was "
+                           "copied. Open it in ChatGPT and run `wait` again.")
     ui = observe(win)
     recents = [e for e in ui.all(role="AXButton", label="Recents")]
     top = recents[0]["bounds"]["y"] if recents else ui.window_top + 50
@@ -383,31 +508,16 @@ def find_by_marker(win, marker, limit=6):
     for row in rows[:limit]:
         click(row)
         time.sleep(3)  # the title switches before the messages do; a quick read still shows the old chat
-        now = observe(win)
-        if shows_marker(now, marker):
+        found = marker_in_chat(win, marker)
+        if found is not None:
             time.sleep(1.5)
             again = observe(win)
-            if again.title == now.title and shows_marker(again, marker):
+            if again.title == found.title and shows_marker(again, marker):
                 log(f"Found the run's chat by its marker: now titled {again.title!r}")
+                scroll_to_bottom(win)
                 return again.title
-            now = again
-        # Our message may be scrolled out of view; a finished answer that echoes the marker identifies it.
-        if now.busy:
-            log(f"  {now.title!r}: still generating, marker not on screen")
-            continue
-        if scroll_to_bottom(win, click_ok=True).answer_copy_button() is None:
-            log(f"  {now.title!r}: no finished answer to copy")
-            continue
-        try:
-            text = copy_answer(win)
-        except RuntimeError as e:  # e.g. a chat whose Copy button is stuck: skip it, keep looking
-            log(f"  {now.title!r}: {e}")
-            continue
-        if marker in text:
-            log(f"Found the run's chat by its answer: now titled {now.title!r}")
-            return now.title
-        log(f"  {now.title!r}: answer ({len(text)} chars) does not contain {marker!r}")
-    log(f"none of the {min(len(rows), limit)} most recent chats is the run's ({marker!r})")
+    log(f"none of the {min(len(rows), limit)} most recent chats is the run's ({marker!r}); "
+        f"search {_SEARCHES} of {MAX_SEARCHES}")
     return None
 
 
@@ -856,11 +966,31 @@ def wait_for_no_draft(win, quiet, timeout):
     raise TimeoutError(f"A draft stayed open in ChatGPT for {timeout:.0f}s; nothing was sent.")
 
 
-def cmd_stop(_args):
+def cmd_stop(args):
+    """Switch off, wait until every registered run has really ended, then quit Peekaboo."""
     os.makedirs(STATE_DIR, exist_ok=True)
     with open(STOP_FILE, "w") as f:
         f.write(time.strftime("%Y-%m-%dT%H:%M:%S"))
-    print(f"bridge switched off ({STOP_FILE}); runs stop before their next click. `resume` switches it on.")
+    print("bridge switched off; waiting for running runs to end...", flush=True)
+    end = time.time() + args.wait
+    while active_runs() and time.time() < end:
+        time.sleep(1)
+    left = active_runs()
+    if left and args.force:
+        for run in left:
+            with contextlib.suppress(OSError):
+                os.kill(run["pid"], signal.SIGTERM)
+        time.sleep(3)
+        left = active_runs()
+    for run in left:
+        print(f"still running: pid {run['pid']} {run['command']} {run.get('what') or ''} (since {run['started']}); "
+              "`stop --force` ends it")
+    if not left and not args.keep_peekaboo:
+        quit_peekaboo(only_if_ours=False)
+    print("stopped: no run is using the screen" + ("" if args.keep_peekaboo or left else "; Peekaboo quit")
+          if not left else "not everything stopped (see above)")
+    if left:
+        sys.exit(1)
 
 
 def cmd_resume(_args):
@@ -870,6 +1000,11 @@ def cmd_resume(_args):
 
 
 def cmd_status(_args):
+    runs = active_runs()
+    print(json.dumps({"switched_on": not os.path.exists(STOP_FILE), "peekaboo_running": peekaboo_running(),
+                      "runs": runs}, ensure_ascii=False, indent=2))
+    if os.path.exists(STOP_FILE) or not peekaboo_running():
+        return  # never start Peekaboo just to look
     win = main_window()
     ui = observe(win)
     entry = load_ledger().get(ui.title)
@@ -1044,11 +1179,17 @@ def emit(text, out):
 
 
 def main():
+    # `kill` (SIGTERM) runs the cleanup too: the clipboard is restored, the run unregistered, Peekaboo quit.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status").set_defaults(fn=cmd_status)
-    sub.add_parser("stop", help="switch the bridge off: every run in every session stops touching the screen"
-                   ).set_defaults(fn=cmd_stop)
+    p = sub.add_parser("stop", help="switch the bridge off: every run in every session stops touching the screen; "
+                                    "waits for them to end, then quits Peekaboo")
+    p.add_argument("--wait", type=float, default=90, help="seconds to wait for running runs to end")
+    p.add_argument("--force", action="store_true", help="terminate runs still alive after --wait")
+    p.add_argument("--keep-peekaboo", action="store_true", help="leave Peekaboo.app running")
+    p.set_defaults(fn=cmd_stop)
     sub.add_parser("resume", help="switch the bridge back on").set_defaults(fn=cmd_resume)
     p = sub.add_parser("usage")
     p.add_argument("title", nargs="?")
@@ -1089,9 +1230,13 @@ def main():
     p.set_defaults(fn=cmd_wait)
     args = ap.parse_args()
     try:
-        if args.cmd not in ("stop", "resume", "usage"):
+        if args.cmd not in ("stop", "resume", "usage", "status"):
             check_stop()  # switched off: do not even read the screen (that would start Peekaboo again)
-        args.fn(args)
+        if args.cmd in SCREEN_COMMANDS:
+            with registered(args):
+                args.fn(args)
+        else:
+            args.fn(args)
     except BudgetExceeded as e:
         print(f"budget: {e}", file=sys.stderr)
         sys.exit(3)

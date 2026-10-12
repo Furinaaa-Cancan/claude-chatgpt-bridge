@@ -137,18 +137,28 @@ python3 ~/.claude/skills/ask-chatgpt/chatgpt_bridge.py status
 ## 已知限制
 
 - **依赖 ChatGPT 界面**：按钮名（Send、Copy、New chat……）或布局一改就可能失效；目前只适配英文界面。在 ChatGPT 桌面版 155.x、Peekaboo 4.2.2、macOS 26.2 上测试。
-- 只支持 macOS，同一时间只能跑一个 ChatGPT 任务。
+- 只支持 macOS。多个任务可以并行生成，点击、发送、复制这几秒钟会排队。
 - 只取回 ChatGPT 的文字回答；它在沙箱里生成的文件（比如它自己的报告、证据包）不会自动下载。
 - token 数是估算值，不是 ChatGPT 的真实计数。
+
+## 随时停下
+
+- `python3 ~/.claude/skills/ask-chatgpt/chatgpt_bridge.py stop`：总开关。所有会话里的任务都在下一次点击前停下，正在等待的也会退出；等它们真的全部结束后再退出 Peekaboo，还有没停的会逐个列出来（`stop --force` 强制结束）。关着时任何命令都不会碰屏幕，退出码 5。`resume` 重新打开。
+- `status`：显示开关状态、Peekaboo 是否在运行、哪些任务正在用屏幕（进程号、做什么、从何时开始）。只是查看时不会启动 Peekaboo。
+- 任务只在需要时才启动 Peekaboo.app，最后一个任务结束时把它关掉。
+- 键盘鼠标空闲满 30 秒任务才会点击或打字，无人值守的任务是 120 秒，所以你在用电脑时它不会抢前台。可以用 `CHATGPT_BRIDGE_USER_IDLE` 调整。
+- 任务找不到自己的对话时，最多搜索 3 轮就放弃并报告。搜索时只看其他对话，绝不复制它们的内容。
 
 ## 故障排查
 
 | 现象 | 处理 |
 |---|---|
 | `status` 报 No ChatGPT window | 打开 ChatGPT 桌面版并保持窗口（可以不在前台） |
-| 权限报错，或读到的元素很少 | 确认 Peekaboo.app 在运行，`permissions status` 三项都是 Granted |
+| 权限报错，或读到的元素很少 | 确认 Peekaboo.app 的权限 `permissions status` 三项都是 Granted（任务需要时会自己启动它） |
+| 退出码 5 / `switched off` | 总开关关着，`resume` 打开 |
+| 日志显示 `someone is using the computer` | 正常：你在用电脑，任务等键盘鼠标空闲后再继续 |
 | 日志显示 `another run is using the ChatGPT window` / `a draft is open` | 正常：另一个任务正在点击或复制（几秒钟），或者你的输入框里有草稿。它会等一下再继续，不会打断 |
-| `Clicked Copy but the clipboard never changed` | 复制那一刻鼠标或焦点被占用了；等一下再 `read-last` |
+| `Clicked Copy but the clipboard never changed` | 复制那一刻鼠标或焦点被占用，或者 ChatGPT 的复制按钮卡在「已复制」。桥接会改用回答里代码块自己的复制按钮；还不行就等一下再 `read-last` |
 | 超时，或进程中途退出 | 先 `status`。还在生成就用 `wait --conversation "标题"` 接管；已经答完就用 `read-last` |
 | `is not visible in the sidebar` | 要续问的对话不在侧边栏可见范围内，改用新对话 |
 | 退出码 3 | 对话快满了，Claude 会生成交接提示词并新开对话 |
@@ -165,7 +175,8 @@ python3 ~/.claude/skills/ask-chatgpt/chatgpt_bridge.py status
 ```bash
 B=~/.claude/skills/ask-chatgpt/chatgpt_bridge.py
 
-python3 $B status                                          # 当前窗口、是否在生成、草稿、用量
+python3 $B status                                          # 开关、Peekaboo、正在运行的任务；当前窗口、是否在生成
+python3 $B stop                                            # 总开关：停下所有任务并退出 Peekaboo（resume 重新打开）
 python3 $B ask - --new-chat --out answer.md < prompt.md    # 新对话提问（提示词从文件读）
 python3 $B ask - --new-chat --attach code.zip --timeout 10800 --poll 10 --out answer.md < prompt.md
 python3 $B ask - --conversation "对话标题" --out answer2.md < followup.md   # 在指定对话里续问
