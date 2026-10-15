@@ -18,6 +18,12 @@ State lives outside the project in `~/.chatgpt-review/<name>-<hash>/` (`review.p
 `state.json`, `round-N/part-K/{zip,prompt.md,answer.md}`, `round-N/report.html`, latest `report.html`.
 Nothing is written into the user's repository.
 
+Keep three limits separate: `--max-file-kb` filters individual source files (default 512 KiB);
+the bridge rejects any uploaded ZIP over 512 MiB **compressed** before UI automation; token
+estimates and `--chunk-tokens` concern review planning, not upload bytes. A package passing the
+upload check may still be rejected by the service or be too broad to review completely. Report
+excluded and unread files, and do not claim coverage from the token ledger.
+
 ## How ChatGPT reviews
 
 By default the whole code base goes to ChatGPT as **one package in one conversation**. Pro unpacks it in its

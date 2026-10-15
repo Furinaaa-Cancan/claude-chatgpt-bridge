@@ -5,7 +5,7 @@
     chatgpt_bridge.py ask PROMPT|- (--new-chat [--title T] | --conversation TITLE) [--attach FILE]
                       [--timeout 1800] [--budget 90000] [--out answer.md]
     chatgpt_bridge.py read-last [--out answer.md]
-    chatgpt_bridge.py wait --conversation TITLE [--out answer.md]   # take over a reply in progress
+    chatgpt_bridge.py wait --conversation TITLE --marker ID [--out answer.md]   # take over a reply in progress
     chatgpt_bridge.py usage [TITLE]
     chatgpt_bridge.py stop [--force] [--keep-peekaboo]   # switch off: every run stops, Peekaboo quits
     chatgpt_bridge.py resume                              # switch back on
@@ -18,9 +18,10 @@ starts Peekaboo.app only when it is needed and quits it when the last run that n
 until the mouse and keyboard have been idle (CHATGPT_BRIDGE_USER_IDLE seconds, default 30) before it
 clicks or types, and gives up after a bounded search instead of looping.
 
-Every conversation gets a ledger entry (~/.chatgpt-bridge/ledger.json) with a deliberately
-high token estimate of everything sent and received, so follow-ups can stop before the
-chat's context window fills up. With --out, a <out>.meta.json records the title and usage.
+Every conversation gets a heuristic token ledger (~/.chatgpt-bridge/ledger.json).
+It cannot measure ChatGPT's actual context usage or review coverage. With --out, a
+<out>.meta.json records the title and estimates. Attachment upload bytes are checked
+separately, before starting UI automation.
 
 Lessons baked in (found by testing against ChatGPT 155.x, Peekaboo 4.2.2):
   * ChatGPT is Chromium-based; the default AX depth stops before the web content, so every
@@ -48,9 +49,11 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
+import uuid
 import zipfile
 
 BRIDGE = os.path.expanduser("~/Library/Application Support/Peekaboo/bridge.sock")
@@ -62,7 +65,6 @@ SENTINEL = "__chatgpt_bridge_sentinel__"
 STATE_DIR = os.path.expanduser("~/.chatgpt-bridge")
 LEDGER = os.path.join(STATE_DIR, "ledger.json")
 STOP_FILE = os.path.join(STATE_DIR, "STOP")  # the off switch, shared by every run in every session
-LAST_INPUT = os.path.join(STATE_DIR, "last-input")  # when a run last clicked or typed
 # Commands that move the mouse, press keys or change the window; reading the screen ("see") does not.
 UI_ACTIONS = {"click", "press", "type", "paste", "scroll", "move", "set-value", "drag", "hotkey"}
 RUNS_DIR = os.path.join(STATE_DIR, "runs")  # one file per live run: who is using the screen and why
@@ -71,10 +73,14 @@ SCREEN_COMMANDS = {"ask", "wait", "read-last"}
 MAX_SEARCHES = 3  # a run that cannot find its chat gives up after this many searches
 USER_IDLE_DEFAULT = "30"
 NEW_CHAT_TITLE = "ChatGPT"
-# Thinking mode is documented at 128K input tokens; stay well below it because hidden
-# reasoning, tool output and file reads also take space.
+# Local accounting policy, not the selected model's context window. Tool output and
+# file reads inside ChatGPT are not observable by this bridge.
 DEFAULT_BUDGET = int(os.environ.get("CHATGPT_BRIDGE_BUDGET", "90000"))
 ATTACH_CONTEXT = int(os.environ.get("CHATGPT_BRIDGE_ATTACH_TOKENS", "30000"))
+# Chat client 26.1007.71326: MAX_CHATGPT_UPLOAD_SIZE_BYTES; rejects size > limit.
+# Account metadata may impose a lower limit. This is bytes on disk (compressed for ZIP),
+# not uncompressed source size, tokens, or a guarantee of complete review coverage.
+MAX_CHATGPT_UPLOAD_SIZE_BYTES = 512 * 1024 * 1024
 
 
 class BudgetExceeded(Exception):
@@ -97,25 +103,27 @@ def check_stop():
 
 
 def user_idle_seconds():
-    out = subprocess.run(["ioreg", "-c", "IOHIDSystem"], capture_output=True, text=True).stdout
-    m = re.search(r'"HIDIdleTime" = (\d+)', out)
-    return int(m.group(1)) / 1e9 if m else float("inf")
+    try:
+        result = subprocess.run(["ioreg", "-c", "IOHIDSystem"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError("Cannot determine user idle time; refusing UI input.") from e
+    m = re.search(r'"HIDIdleTime" = (\d+)', result.stdout)
+    if result.returncode != 0 or not m:
+        raise RuntimeError("Cannot determine user idle time; refusing UI input.")
+    return int(m.group(1)) / 1e9
 
 
 def wait_until_user_away():
     """Touch the screen only after nobody has used the mouse or keyboard for CHATGPT_BRIDGE_USER_IDLE seconds
-    (default 30; unattended runs use more, 0 turns it off), so a run never takes over a computer someone is
-    using. Input from the runs themselves (recorded in LAST_INPUT) does not count as someone using it."""
+    (default 30, 0 turns it off), so a run never takes over a computer someone is
+    using. macOS idle time cannot reliably attribute input to a human versus this bridge;
+    both reset the quiet period. Never infer ownership from similar timestamps."""
     need = float(os.environ.get("CHATGPT_BRIDGE_USER_IDLE", USER_IDLE_DEFAULT) or 0)
     announced = False
     while need:
         check_stop()
         idle = user_idle_seconds()
-        try:
-            ours = time.time() - os.path.getmtime(LAST_INPUT)
-        except OSError:
-            ours = float("inf")
-        if idle >= need or abs(ours - idle) < 3:
+        if idle >= need:
             return
         if not announced:
             log(f"someone is using the computer; waiting until it has been idle for {need:.0f}s")
@@ -202,16 +210,16 @@ def registered(args):
             quit_peekaboo()
 
 
-def pk(*args, check=True, timeout=60):
+def pk(*args, check=True, timeout=60, prepared=False):
     if args and args[0] in UI_ACTIONS:
         check_stop()
-        wait_until_user_away()
+        if not prepared:
+            wait_until_user_away()
+        check_stop()
+        if front_bundle() != BUNDLE:
+            raise RuntimeError("ChatGPT lost foreground focus; refusing UI input.")
     cmd = ["peekaboo", *args, "--bridge-socket", BRIDGE, "--json"]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=UTF8)
-    if args and args[0] in UI_ACTIONS:
-        os.makedirs(STATE_DIR, exist_ok=True)
-        with open(LAST_INPUT, "w") as f:
-            f.write(str(time.time()))
     try:
         d = json.loads(p.stdout)
     except json.JSONDecodeError:
@@ -266,7 +274,7 @@ class UI:
     @property
     def input_text(self):
         # An empty composer reports its placeholder as the value.
-        value = ((self.input or {}).get("value") or "").strip()
+        value = (self.input or {}).get("value") or ""
         return "" if value == (self.input or {}).get("label") else value
 
     def composer_buttons(self):
@@ -322,6 +330,8 @@ def observe(win):
         try:
             d = pk("see", "--app", APP, "--window-id", str(wid), "--tree", "--no-screenshot", *AX_LIMITS)
             ui = UI(d["data"])
+            for element in ui.els:
+                element["_window"] = win
             if ui.one(role="AXWebArea") or attempt == 4:
                 return ui
             wake_web_content(wid)
@@ -384,37 +394,56 @@ def raise_chatgpt():
     raise RuntimeError("Could not bring ChatGPT to the front; refusing to send input blind.")
 
 
-def click(el, double=False):
-    """Real foreground click at the element's centre (global screen points)."""
+def fresh_target(el, resolve=None):
+    """Resolve after focus/idle waits; never reuse an old global coordinate."""
+    win = el.get("_window")
+    if win is None:
+        raise RuntimeError("UI target has no observed window; refusing input.")
+    ui = observe(win)
+    if resolve:
+        target = resolve(ui)
+    else:
+        matches = ui.all(role=el.get("ax_role"), label=el.get("label") or "")
+        target = matches[0] if len(matches) == 1 else None
+    if not target or not target.get("bounds") or target.get("is_enabled") is False:
+        raise RuntimeError("UI target disappeared, is disabled, or is ambiguous; refusing input.")
+    return target
+
+
+def click(el, double=False, resolve=None):
+    """Real foreground click using freshly resolved bounds."""
     raise_chatgpt()
+    el = fresh_target(el, resolve)
     b = el["bounds"]
     x, y = round(b["x"] + b["width"] / 2), round(b["y"] + b["height"] / 2)
-    pk("click", "--at", f"{x},{y}", "--global", "--foreground", *(["--double"] if double else []))
+    pk("click", "--at", f"{x},{y}", "--global", "--foreground", *(["--double"] if double else []), prepared=True)
 
 
 def hover(el):
     raise_chatgpt()
+    el = fresh_target(el)
     b = el["bounds"]
     pk("move", "--at", f"{round(b['x'] + b['width'] / 2)},{round(b['y'] + b['height'] / 2)}", "--global",
-       "--foreground")
+       "--foreground", prepared=True)
 
 
 def key(chord):
     raise_chatgpt()
-    pk("press", chord, "--foreground")
+    pk("press", chord, "--foreground", prepared=True)
 
 
 def type_text(text):
     raise_chatgpt()
-    pk("type", text, "--foreground")
+    pk("type", text, "--foreground", prepared=True)
 
 
 def scroll_to_bottom(win, click_ok=False):
-    """Bring the end of the answer (its action bar) on screen. Background wheel scrolling first; some layouts
+    """Bring the end of the answer (its action bar) on screen under the UI lock. Some layouts
     (e.g. with the agent side panel) ignore it, so with click_ok — only while holding the UI lock — fall
     back to clicking ChatGPT's own "Scroll to bottom" button."""
-    ui = observe(win)
     for _ in range(3):
+        raise_chatgpt()
+        ui = observe(win)
         button = ui.one(role="AXButton", label="Scroll to bottom")
         if ui.answer_copy_button() is not None or not button:
             return ui
@@ -426,8 +455,9 @@ def scroll_to_bottom(win, click_ok=False):
         if not areas:
             break
         area = min(areas, key=lambda a: a["bounds"]["width"] * a["bounds"]["height"])
+        # Focus/idle waits precede this snapshot; dispatch without another stale-state wait.
         pk("scroll", "--direction", "down", "--amount", "80", "--on", area["id"], "--snapshot", ui.snapshot,
-           check=False)
+           check=False, prepared=True)
         time.sleep(0.4)
         ui = observe(win)
     button = ui.one(role="AXButton", label="Scroll to bottom")
@@ -455,10 +485,12 @@ def shows_marker(ui, marker):
     if not marker:
         return False
     edge = max((r["bounds"]["x"] + r["bounds"]["width"] for r in conversation_rows(ui)), default=None)
+    if edge is None:
+        return False  # no reliable boundary between sidebar and conversation
     for e in ui.els:
         if marker in (e.get("label") or "") or marker in str(e.get("value") or ""):
             b = e.get("bounds")
-            if edge is not None and b and b["x"] + b["width"] / 2 < edge:
+            if not b or b["x"] < edge or e.get("ax_role") in ("AXTextArea", "AXWebArea", "AXWindow"):
                 continue
             return True
     return False
@@ -484,8 +516,13 @@ def marker_in_chat(win, marker):
         area = conversation_area(ui)
         if area is None:
             return None
+        raise_chatgpt()
+        ui = observe(win)
+        area = conversation_area(ui)
+        if area is None:
+            return None
         pk("scroll", "--direction", "up", "--amount", "150", "--on", area["id"], "--snapshot", ui.snapshot,
-           check=False)
+           check=False, prepared=True)
         time.sleep(0.6)
     ui = observe(win)
     return ui if shows_marker(ui, marker) else None
@@ -521,9 +558,11 @@ def find_by_marker(win, marker, limit=6):
     return None
 
 
-def open_conversation(win, title):
+def open_conversation(win, title, marker):
+    if not marker:
+        raise RuntimeError("Conversation identity is unknown; start a new chat.")
     ui = observe(win)
-    if ui.title == title:
+    if marker_in_chat(win, marker):
         return
     rows = [e for e in conversation_rows(ui) if e.get("label") == title]
     if len(rows) != 1:
@@ -531,9 +570,42 @@ def open_conversation(win, title):
         raise RuntimeError(f"Conversation {title!r} {problem}; not sending.")
     click(rows[0])
     wait_for(win, lambda ui: ui.title == title and ui.input, 10, f"conversation {title!r} to open")
+    if not marker_in_chat(win, marker):
+        raise RuntimeError("Conversation marker did not match; refusing to upload or send.")
 
 
-def attach(win, path):
+def validate_attachment_size(path):
+    """Check on-disk upload bytes without reading/decompressing the attachment."""
+    try:
+        info = os.stat(path)
+    except OSError as e:
+        raise RuntimeError(f"Cannot inspect attachment {os.fspath(path)!r}: {e}") from e
+    if not stat.S_ISREG(info.st_mode):
+        raise RuntimeError(f"Attachment is not a regular file: {os.fspath(path)!r}")
+    if info.st_size > MAX_CHATGPT_UPLOAD_SIZE_BYTES:
+        raise RuntimeError(
+            f"Attachment upload size exceeds the limit: {os.fspath(path)!r} is "
+            f"{info.st_size:,} bytes; maximum is 512 MiB "
+            f"({MAX_CHATGPT_UPLOAD_SIZE_BYTES:,} bytes). Nothing was uploaded. "
+            "For ZIP files this checks the compressed file size. Reduce or split the attachment; "
+            "changing --budget or CHATGPT_BRIDGE_ATTACH_TOKENS does not change the upload limit."
+        )
+    return info.st_size
+
+
+def require_target(ui, marker=None):
+    require_chat_ui(ui)
+    if marker:
+        if not shows_marker(ui, marker):
+            raise RuntimeError("Target conversation identity is not visible; refusing upload or input.")
+    elif ui.title != NEW_CHAT_TITLE or ui.has_messages:
+        raise RuntimeError("Expected an empty new chat; refusing upload or input.")
+    if ui.busy or ui.input_text:
+        raise RuntimeError("Target chat is generating or contains a draft; refusing upload or input.")
+
+
+def attach(win, path, conversation_marker=None):
+    validate_attachment_size(path)
     src = os.path.abspath(path)
     name = os.path.basename(src)
     # The open panel lists only what is on screen, so the file goes alone into a fresh folder.
@@ -545,8 +617,16 @@ def attach(win, path):
                 shutil.rmtree(path, ignore_errors=True)
     folder = os.path.join(outbox, time.strftime("%Y%m%d-%H%M%S"))
     os.makedirs(folder, exist_ok=True)
-    shutil.copy2(src, os.path.join(folder, name))
-    click(observe(win).one(role="AXButton", label="Add files and more") or _missing("attach button"))
+    staged = os.path.join(folder, name)
+    shutil.copy2(src, staged)
+    # Recheck the actual upload copy in case the source grew after preflight.
+    validate_attachment_size(staged)
+    def upload_target(ui):
+        require_target(ui, conversation_marker)
+        return ui.one(role="AXButton", label="Add files and more")
+
+    click(observe(win).one(role="AXButton", label="Add files and more") or _missing("attach button"),
+          resolve=upload_target)
     item = wait_for(win, lambda ui: next(iter(ui.all(role="AXButton", prefix="Add photos & files")), None), 5,
                     "the upload menu item")
     click(item)
@@ -587,36 +667,51 @@ def attach(win, path):
     log(f"Attached {name}")
 
 
-def require_chat_mode(win):
-    switch = next(iter(observe(win).all(prefix="Switch mode, current mode:")), None)
-    if switch and not switch["label"].endswith(": ChatGPT"):
+def require_chat_ui(ui):
+    switches = ui.all(prefix="Switch mode, current mode:")
+    if len(switches) != 1:
+        raise RuntimeError("Cannot confirm Chat mode; refusing to upload or send.")
+    switch = switches[0]
+    if not switch["label"].endswith(": ChatGPT"):
         raise RuntimeError(f"ChatGPT is not in Chat mode ({switch['label']!r}); switch it back to Chat first.")
 
 
-def set_prompt(win, prompt):
+def require_chat_mode(win):
+    require_chat_ui(observe(win))
+
+
+def set_prompt(win, prompt, conversation_marker=None):
+    raise_chatgpt()
     ui = observe(win)
+    require_target(ui, conversation_marker)
     box = ui.input or _missing("ChatGPT input box")
     if ui.input_text:
         raise RuntimeError(f"The input box already holds a draft ({ui.input_text[:60]!r}); refusing to overwrite it.")
     # set-value reports an untrusted receipt for Chromium but does dispatch; verify by re-reading.
-    pk("set-value", "--on", box["id"], "--snapshot", ui.snapshot, "--value", prompt, check=False)
+    pk("set-value", "--on", box["id"], "--snapshot", ui.snapshot, "--value", prompt, check=False, prepared=True)
     time.sleep(0.4)
     ui = observe(win)
-    if squash(ui.input_text) != squash(prompt):
+    if normalize_newlines(ui.input_text) != normalize_newlines(prompt):
         raise RuntimeError(f"Input box does not hold the full prompt (box shows {ui.input_text[:80]!r}...).")
 
 
-def send(win):
+def send(win, prompt, marker):
     # Uploads keep Send disabled until they finish.
     button = wait_for(win, lambda ui: ui.send_button if (ui.send_button or {}).get("is_enabled") else None,
                       300, "Send to become available")
+    def target(ui):
+        require_chat_ui(ui)
+        if normalize_newlines(ui.input_text) != normalize_newlines(prompt):
+            raise RuntimeError("Prompt changed before Send; delivery not attempted.")
+        return ui.send_button
+
     log("Sending prompt...")
-    click(button)
-    wait_for(win, lambda ui: ui.busy or not ui.input_text, 5,
-             "the prompt to leave the input box (it was not sent)")
+    click(button, resolve=target)
+    wait_for(win, lambda ui: shows_marker(ui, marker) and (ui.busy or not ui.input_text), 10,
+             "the sent request marker (delivery is unknown; do not resend automatically)")
 
 
-def rename_conversation(win, new_title):
+def rename_conversation(win, new_title, marker):
     """Give the open chat a title of our own: ChatGPT keeps renaming auto-titled chats while and after
     answering, and auto titles repeat ("代码审查报告" twice), which makes a chat impossible to find again.
     The value is written into the title field directly (typing goes through the input method)."""
@@ -624,7 +719,14 @@ def rename_conversation(win, new_title):
     head = [e for e in ui.all(role="AXButton", label=ui.title) if e["bounds"]["y"] < ui.window_top + 45]
     if not head:
         raise RuntimeError("Could not find the conversation title in the window header.")
-    click(head[0])
+    def title_target(current):
+        if not shows_marker(current, marker):
+            raise RuntimeError("Request identity changed before renaming; leaving title unchanged.")
+        candidates = [e for e in current.all(role="AXButton", label=current.title)
+                      if e["bounds"]["y"] < current.window_top + 45]
+        return candidates[0] if len(candidates) == 1 else None
+
+    click(head[0], resolve=title_target)
     for _ in range(10):
         time.sleep(0.4)
         ui = observe(win)
@@ -636,14 +738,17 @@ def rename_conversation(win, new_title):
     # Paste, not set-value: a value written straight into the field only changes what is displayed, and
     # ChatGPT later restores its own title. Paste fires real input events (and, unlike typing, does not go
     # through the input method).
-    key("cmd+a")
     raise_chatgpt()
+    ui = observe(win)
+    if not shows_marker(ui, marker) or not ui.one(role="AXTextField", label="Chat title"):
+        raise RuntimeError("Rename field or request identity changed; refusing to type.")
+    pk("press", "cmd+a", "--foreground", prepared=True)
     # Peekaboo cannot confirm a hotkey paste ("did not return a confirmed outcome") even when it worked:
     # judge by the resulting title instead.
-    pk("paste", "--text", new_title, "--foreground", check=False)
+    pk("paste", "--text", new_title, "--foreground", check=False, prepared=True)
     time.sleep(0.4)
     if observe(win).one(role="AXTextField", label="Chat title"):
-        key("Return")
+        pk("press", "Return", "--foreground", prepared=True)
     wait_for(win, lambda u: u.title == new_title, 6, f"the chat to be titled {new_title!r}")
     time.sleep(3)
     if new_title not in sidebar_titles(observe(win)) and observe(win).title != new_title:
@@ -652,7 +757,7 @@ def rename_conversation(win, new_title):
     return new_title
 
 
-def pin_title(win, prompt):
+def pin_title(win, prompt, marker):
     """Remember the new chat's title so a long run can be found again.
 
     Right after sending, the page is titled with the prompt itself; ChatGPT renames the chat a little
@@ -666,7 +771,7 @@ def pin_title(win, prompt):
 
     def real_title(ui):
         t = plain(ui.title)
-        if not ui.busy or ui.title in ("", NEW_CHAT_TITLE) or t.startswith(head) or head.startswith(t):
+        if not shows_marker(ui, marker) or not ui.busy or ui.title in ("", NEW_CHAT_TITLE) or t.startswith(head) or head.startswith(t):
             return None
         return ui.title
 
@@ -757,7 +862,7 @@ def wait_for_answer(win, timeout, poll, prev=None, title=None, marker=None):
                     now = observe(win)
                     if now.title != title and not now.input_text:
                         try:
-                            open_conversation(win, title)
+                            open_conversation(win, title, marker)
                         except RuntimeError as e:  # renamed out of sight, or scrolled out of the sidebar
                             found = find_by_marker(win, marker) if marker else None
                             if found:
@@ -774,7 +879,11 @@ def wait_for_answer(win, timeout, poll, prev=None, title=None, marker=None):
         if stay:
             log("ChatGPT offered to switch to Work mode; choosing Stay in Chat")
             with ui_step("Stay in Chat"):
-                click(stay)
+                def stay_target(current):
+                    if not shows_marker(current, marker):
+                        raise RuntimeError("Request identity changed before mode confirmation.")
+                    return next(iter(current.all(role="AXButton", prefix="Stay in Chat")), None)
+                click(stay, resolve=stay_target)
             restore(prev)
             continue
         if os.environ.get("CHATGPT_BRIDGE_DEBUG"):
@@ -786,11 +895,9 @@ def wait_for_answer(win, timeout, poll, prev=None, title=None, marker=None):
             seen_busy, stable = True, 0
             continue
         if ui.answer_copy_button() is None and ui.one(role="AXButton", label="Scroll to bottom"):
-            ui = scroll_to_bottom(win)
-            if ui.answer_copy_button() is None and not ui.busy:
-                with ui_step("scrolling to the end of the answer"):
-                    if observe(win).title == title or not title:
-                        ui = scroll_to_bottom(win, click_ok=True)
+            with ui_step("scrolling to the end of the answer"):
+                if marker_in_chat(win, marker):
+                    ui = scroll_to_bottom(win, click_ok=True)
         ready = ui.answer_copy_button() is not None and not ui.input_text
         if ready and (seen_busy or time.time() - start > 20):
             stable += 1
@@ -812,10 +919,10 @@ def code_block_copy_button(ui):
     return max(above, key=lambda e: e["bounds"]["y"]) if above else None
 
 
-def _clicked_text(btn):
+def _clicked_text(btn, resolve):
     """Click a copy button; the new clipboard text, or None if the clipboard did not change."""
     subprocess.run(["pbcopy"], input=SENTINEL, text=True, env=UTF8, check=True)
-    click(btn)
+    click(btn, resolve=resolve)
     for _ in range(20):
         time.sleep(0.25)
         text = subprocess.run(["pbpaste"], capture_output=True, text=True, env=UTF8).stdout
@@ -824,7 +931,12 @@ def _clicked_text(btn):
     return None
 
 
-def copy_answer(win):  # caller holds the UI lock
+def copy_answer(win, marker=None):  # caller holds the UI lock
+    def target(ui, code_block=False):
+        if marker and not shows_marker(ui, marker):
+            raise RuntimeError("Request identity is not visible at copy time; refusing to copy another chat.")
+        return code_block_copy_button(ui) if code_block else ui.answer_copy_button()
+
     ui = scroll_to_bottom(win, click_ok=True)
     btn = ui.answer_copy_button() or _missing("a Copy button for an answer")
     for _ in range(3):  # a recent click leaves it as "Copied" for a while; move off it and let it reset
@@ -838,7 +950,7 @@ def copy_answer(win):  # caller holds the UI lock
     pk("clipboard", "save", "--slot", "chatgpt_bridge")
     try:
         for _ in range(2):
-            text = _clicked_text(btn)
+            text = _clicked_text(btn, target)
             if text is not None:
                 return text
             ui = scroll_to_bottom(win, click_ok=True)
@@ -848,7 +960,7 @@ def copy_answer(win):  # caller holds the UI lock
         # has a working Copy button of its own.
         block = code_block_copy_button(ui)
         if block is not None:
-            text = _clicked_text(block)
+            text = _clicked_text(block, lambda ui: target(ui, code_block=True))
             if text is not None:
                 log("the answer's Copy button is stuck; copied its last code block instead")
                 return text
@@ -876,8 +988,8 @@ def _missing(what):
     raise RuntimeError(f"Could not find {what} in the ChatGPT window.")
 
 
-def squash(text):
-    return "".join(text.split())
+def normalize_newlines(text):
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 # ---------------------------------------------------------------- context ledger
@@ -920,6 +1032,32 @@ def save_ledger(ledger):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(ledger, f, ensure_ascii=False, indent=2)
     os.replace(tmp, LEDGER)
+
+
+@contextlib.contextmanager
+def ledger_lock():
+    """Serialize the entire read/modify/write, independently of the UI lock."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(os.path.join(STATE_DIR, "ledger.lock"), "a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def write_request(args, phase, title=None):
+    """Persist identity before sending, so uncertain delivery can be recovered without resending."""
+    folder = os.path.join(STATE_DIR, "requests")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, args.marker + ".json")
+    data = {"marker": args.marker, "phase": phase, "conversation": title or args.conversation,
+            "out": args.out, "previous_marker": getattr(args, "previous_marker", None),
+            "updated": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    with open(path + ".tmp", "w", encoding="utf-8") as stream:
+        json.dump(data, stream, ensure_ascii=False, indent=2)
+    os.replace(path + ".tmp", path)
+    return path
 
 
 # ---------------------------------------------------------------- commands
@@ -1044,22 +1182,35 @@ def cmd_ask(args):
     prompt = sys.stdin.read() if args.prompt == "-" else args.prompt
     if not prompt.strip():
         raise RuntimeError("Empty prompt.")
-    if args.attach and not os.path.isfile(args.attach):
-        raise RuntimeError(f"Attachment not found: {args.attach}")
-    # ChatGPT works through an uploaded archive with its own tools instead of loading it whole, so an
-    # attachment is charged as its text size capped at ATTACH_CONTEXT (what such a turn typically reads).
+    if args.attach:
+        validate_attachment_size(args.attach)
+    args.marker = "bridge-run-" + uuid.uuid4().hex
+    prompt += ("\n\n[Bridge request identity]\n" + args.marker +
+               "\nReturn this exact identity in your answer. If answering with JSON, "
+               "include it in the summary string. Do not change the requested output format.")
+    # Heuristic bookkeeping only: the cap does not measure or bound ChatGPT's file reads.
     cost = est_tokens(prompt) + (min(attachment_tokens(args.attach), ATTACH_CONTEXT) if args.attach else 0)
     ledger = load_ledger()
+    args.previous_marker = None
     if args.conversation:
         entry = ledger.get(args.conversation)
         if entry is None:
             raise RuntimeError(f"No ledger entry for {args.conversation!r}; its usage is unknown. Use --new-chat.")
+        if not entry.get("marker"):
+            raise RuntimeError("This conversation has no verified request identity. Use --new-chat.")
+        if entry.get("ambiguous"):
+            raise RuntimeError("This title belongs to multiple conversations; use --new-chat with a handoff.")
+        args.previous_marker = entry["marker"]
         if entry["tokens"] + cost > args.budget:
-            raise BudgetExceeded(f"{args.conversation!r} has used ~{entry['tokens']} tokens; this turn adds ~{cost}, "
-                                 f"over the {args.budget} budget. Start a new chat with a handoff summary.")
+            raise BudgetExceeded(f"{args.conversation!r} has a local estimate of ~{entry['tokens']} tokens; "
+                                 f"this turn adds ~{cost}, over the local {args.budget} token budget. "
+                                 "This is separate from the attachment upload size limit. "
+                                 "Start a new chat with a handoff summary.")
     elif cost > args.budget:
-        log(f"warning: this prompt alone is ~{cost} tokens, above the {args.budget} budget")
+        log(f"warning: this turn's local estimate is ~{cost} tokens, above the {args.budget} token budget")
 
+    receipt = write_request(args, "prepared")
+    log(f"Request identity: {args.marker}; recovery receipt: {receipt}")
     win = main_window()
     while True:
         if args.wait_idle:
@@ -1076,33 +1227,43 @@ def cmd_ask(args):
                 if args.new_chat:
                     open_new_chat(win)
                 else:
-                    open_conversation(win, args.conversation)
-                if args.attach:
-                    attach(win, args.attach)
+                    open_conversation(win, args.conversation, entry["marker"])
                 require_chat_mode(win)
-                set_prompt(win, prompt)
-                send(win)
-                pinned = pin_title(win, prompt) if args.new_chat else args.conversation
+                if observe(win).busy:
+                    raise RuntimeError("Target chat is still generating; refusing to upload or send.")
+                if args.attach:
+                    attach(win, args.attach, entry["marker"] if args.conversation else None)
+                require_chat_mode(win)
+                set_prompt(win, prompt, entry["marker"] if args.conversation else None)
+                write_request(args, "sending")
+                try:
+                    send(win, prompt, args.marker)
+                except (RuntimeError, TimeoutError, subprocess.TimeoutExpired) as e:
+                    write_request(args, "delivery_unknown")
+                    raise RuntimeError(f"Delivery could not be confirmed; do not resend automatically. "
+                                       f"Inspect {receipt} and recover with wait --marker {args.marker}. {e}") from e
+                write_request(args, "sent")
+                pinned = pin_title(win, prompt, args.marker) if args.new_chat else args.conversation
                 if args.new_chat and args.title:
                     try:
-                        pinned = rename_conversation(win, args.title)
+                        pinned = rename_conversation(win, args.title, args.marker)
                     except RuntimeError as e:
                         log(f"warning: could not rename the chat ({e}); following ChatGPT's own title instead")
+                write_request(args, "sent", pinned)
             finally:
                 restore(prev)
         break
     try:
-        text, title = collect_answer(win, args, prev, pinned,
-                                     args.marker or (os.path.basename(args.attach) if args.attach else None))
+        text, title = collect_answer(win, args, prev, pinned, args.marker)
     finally:
         restore(prev)
     record(title, cost, text, args)
+    write_request(args, "completed", title)
 
 
 def collect_answer(win, args, prev, pinned, marker=None):
-    # With an explicit --marker the copied answer must contain it: copying another chat's answer (another
-    # run or the user switched the window at the wrong moment) must never end up in the output.
-    verify = bool(getattr(args, "marker", None))
+    if not marker:
+        raise RuntimeError("No request identity; refusing to collect an unverified answer.")
     deadline = time.time() + args.timeout
     for _ in range(4):
         pinned = wait_for_answer(win, max(120, deadline - time.time()), args.poll, prev, pinned, marker)
@@ -1110,21 +1271,21 @@ def collect_answer(win, args, prev, pinned, marker=None):
         text = None
         with ui_step("copying"):
             ui = observe(win)
-            if pinned and ui.title != pinned and not shows_marker(ui, marker):  # another run switched it
+            if not marker_in_chat(win, marker):
                 try:
-                    open_conversation(win, pinned)
+                    open_conversation(win, pinned, marker)
                 except RuntimeError:
-                    pinned = (find_by_marker(win, marker) if marker else None) or _raise(
+                    pinned = find_by_marker(win, marker) or _raise(
                         f"Could not find the chat {pinned!r} again.")
             if observe(win).busy:  # the chat found again is still answering
                 log("that chat is still generating; waiting for it")
                 continue
             try:
-                text = copy_answer(win)
+                text = copy_answer(win, marker)
             except RuntimeError as e:
                 log(f"{e} Looking again.")
             title = pinned or settled_title(win)
-        if text is not None and (not verify or marker in text):
+        if text is not None and marker in text:
             return text, title
         if text is not None:
             log(f"the copied answer does not contain {marker!r} (another chat was on screen); looking again")
@@ -1138,6 +1299,15 @@ def collect_answer(win, args, prev, pinned, marker=None):
 
 def cmd_wait(args):
     """Attach to a reply that is already being generated (e.g. after the original run died)."""
+    if not re.fullmatch(r"bridge-run-[0-9a-f]{32}", args.marker):
+        raise RuntimeError("Use the exact bridge-run identity from the sending run's recovery receipt.")
+    receipt_path = os.path.join(STATE_DIR, "requests", args.marker + ".json")
+    try:
+        with open(receipt_path, encoding="utf-8") as stream:
+            receipt = json.load(stream)
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"Cannot read recovery receipt: {receipt_path}") from e
+    args.previous_marker = receipt.get("previous_marker")
     cost = 0
     if args.prompt_file:
         with open(args.prompt_file, encoding="utf-8") as f:
@@ -1151,17 +1321,24 @@ def cmd_wait(args):
     finally:
         restore(prev)
     record(title, cost, text, args)
+    write_request(args, "completed", title)
 
 
 def record(title, cost, text, args):
-    ledger = load_ledger()  # re-read: other runs may have written it while this one waited
-    entry = ledger.setdefault(title, {"tokens": 0, "turns": 0, "created": time.strftime("%Y-%m-%dT%H:%M:%S")})
-    entry["tokens"] += cost + est_tokens(text)
-    entry["turns"] += 1
-    entry["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    save_ledger(ledger)
+    with ledger_lock():
+        ledger = load_ledger()
+        entry = ledger.setdefault(title, {"tokens": 0, "turns": 0, "created": time.strftime("%Y-%m-%dT%H:%M:%S")})
+        if entry.get("marker") and entry["marker"] not in (args.marker, getattr(args, "previous_marker", None)):
+            # Titles are not unique IDs. Do not let a later continuation target a different chat.
+            entry["ambiguous"] = True
+        if entry.get("marker") != args.marker:
+            entry["tokens"] += cost + est_tokens(text)
+            entry["turns"] += 1
+        entry["marker"] = args.marker
+        entry["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        save_ledger(ledger)
     meta = {"title": title, "tokens_used": entry["tokens"], "turns": entry["turns"], "budget": args.budget,
-            "remaining": args.budget - entry["tokens"]}
+            "remaining": args.budget - entry["tokens"], "marker": args.marker}
     log(f"Conversation {title!r}: ~{entry['tokens']}/{args.budget} tokens after {entry['turns']} turn(s)")
     emit(text, args.out)
     if args.out:
@@ -1204,12 +1381,12 @@ def main():
     target.add_argument("--conversation", help="continue the conversation with this exact title")
     p.add_argument("--title", help="with --new-chat: rename the chat to this unique title right after sending, "
                                    "so it can be found again later")
-    p.add_argument("--attach", help="file to upload with the prompt (e.g. a .zip)")
-    p.add_argument("--marker", help="text unique to this run that shows in its message and answer (default: the "
-                                    "attachment's file name); used to find the chat again after ChatGPT renames it")
+    p.add_argument("--attach", help="file to upload (e.g. a .zip); at most 512 MiB on disk, "
+                   "account limits may be lower; independent of the token budget")
     p.add_argument("--timeout", type=float, default=1800, help="seconds to wait for the answer")
     p.add_argument("--poll", type=float, default=3, help="seconds between UI checks")
-    p.add_argument("--budget", type=int, default=DEFAULT_BUDGET, help="token budget per conversation")
+    p.add_argument("--budget", type=int, default=DEFAULT_BUDGET,
+                   help="local estimated token budget per conversation, not an upload size limit")
     p.add_argument("--out", help="write the answer here (and metadata to <out>.meta.json)")
     p.add_argument("--no-wait-idle", dest="wait_idle", action="store_false",
                    help="fail at once if a draft is open in ChatGPT instead of waiting for it to go")
@@ -1218,8 +1395,7 @@ def main():
     p.add_argument("--idle-timeout", type=float, default=10800, help="give up waiting after this")
     p.set_defaults(fn=cmd_ask)
     p = sub.add_parser("wait", help="wait for a reply already in progress in a conversation, then copy it")
-    p.add_argument("--marker", help="text unique to the run's message (e.g. its attachment file name), used to "
-                                    "recognise the chat after ChatGPT renamed it")
+    p.add_argument("--marker", required=True, help="exact bridge-run identity from the sending run's receipt")
     p.add_argument("--conversation", required=True, help="exact title of the conversation")
     p.add_argument("--prompt-file", help="the prompt that was sent (for the token ledger)")
     p.add_argument("--attach", help="the file that was attached (for the token ledger)")
@@ -1232,6 +1408,8 @@ def main():
     try:
         if args.cmd not in ("stop", "resume", "usage", "status"):
             check_stop()  # switched off: do not even read the screen (that would start Peekaboo again)
+        if args.cmd == "ask" and args.attach:
+            validate_attachment_size(args.attach)  # before registered() starts Peekaboo
         if args.cmd in SCREEN_COMMANDS:
             with registered(args):
                 args.fn(args)

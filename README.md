@@ -108,16 +108,16 @@ python3 ~/.claude/skills/ask-chatgpt/chatgpt_bridge.py status
 
 ### 运行时会发生什么
 
-- **上传、发送、复制结果这几秒**，ChatGPT 会被切到前台、鼠标会动一下。这时候别点鼠标或打字，否则那一步可能失败（脚本会报错停下，不会乱点）。
+- **上传、发送、复制结果的操作阶段**，ChatGPT 会被切到前台、鼠标会动一下。这时候别点鼠标或打字，否则那一步可能失败（脚本会报错停下，不会乱点）。
 - **中间的等待都在后台**，可能二三十分钟。你可以照常用电脑，甚至用 ChatGPT 的其他对话，脚本会等你空闲后再切回审查用的那个对话。
-- **可以并行**：ChatGPT 本身能同时生成多个对话。多个任务（包括不同 Claude Code 会话发起的）各开各的对话、同时生成；只有点击、上传、发送、复制这几秒钟会互相让一下，不会抢着点。
+- **可以并行**：ChatGPT 本身能同时生成多个对话。多个任务（包括不同 Claude Code 会话发起的）各开各的对话、同时生成；点击、上传、发送、滚动和复制受同一把锁保护；用量账本的读改写另有进程锁。
 - **不会打断你打字**：如果输入框里有你没发的草稿，它会等草稿消失 1 分钟后再动窗口。
 - 用的是 ChatGPT 里**当前选中的模型**，审代码前记得选好 Pro。
 
 ### 报告长什么样
 
 - 顶部：待修改数量、各严重级别计数、已修复数量
-- Claude 的总结 + ChatGPT 的概述 + 覆盖情况（深读了多少文件、只扫描了多少）+ 对话上下文用量
+- Claude 的总结 + ChatGPT 的概述 + 覆盖情况（深读了多少文件、只扫描了多少）+ 本地 token 估算账本（非实际上下文用量）
 - **要改的点**：按严重程度编号，每条有位置、问题、证据代码、修改建议、ChatGPT 的验证方式、Claude 的核实意见；可按级别筛选，可一键复制修改清单
 - 折叠区：已修复（含 ChatGPT 对修复的核实）、不修改 / 存疑（含理由和 ChatGPT 的回应）
 - 浅色 / 深色自适应，手机上也能看
@@ -126,17 +126,21 @@ python3 ~/.claude/skills/ask-chatgpt/chatgpt_bridge.py status
 
 ## 注意事项
 
-**上传了什么**：只上传你指定范围内的代码。以下内容自动排除，被排除的疑似密钥文件会在上传前列给你看：`.env*`（`.env.example` 除外）、私钥和证书、`credentials*.json` 之类的凭据文件、内容里含 API Key / Token 特征的文件、`node_modules` / 构建产物 / 缓存、二进制文件和超过 512 KB 的文件。
+**上传了什么**：只上传你指定范围内的代码。以下内容自动排除，被排除的疑似密钥文件会在上传前列给你看：`.env*`（`.env.example` 除外）、私钥和证书、`credentials*.json` 之类的凭据文件、内容里含 API Key / Token 特征的文件、`node_modules` / 构建产物 / 缓存、二进制文件和超过 512 KiB 的源码文件（打包筛选设置，可用 `pack --max-file-kb` 调整）。
+
+**单个附件上传大小**：`ask --attach` 在启动 Peekaboo、读取附件内容和操作界面之前检查文件的磁盘字节数；复制到上传目录后再次检查。单个文件最大 **512 MiB（536,870,912 字节）**，等于上限可通过本地大小检查，超过则退出码 `1`，提示文件实际大小、上限及缩小或拆包建议。ZIP 检查的是**压缩后的 ZIP 文件大小**，不是解压后代码总量。此硬上限来自 Chat 客户端 26.1007.71326 的上传校验（2026-10-15 核对）；账号配置、文件类型或服务端处理仍可能施加更低限制。本地检查通过不保证上传成功或完整审查。总开关关闭时仍优先退出码 `5`。
+
+OpenAI 的[文件上传说明](https://help.openai.com/en/articles/8555545-uploading-files-and-audio-to-chatgpt)列出了文档单文件 512 MB，以及文本/文档单文件 200 万 token 的处理限制；后者也不等于对话上下文窗口。不要用 API 的上传限制推算本项目的 Chat 界面限制。
 
 **存在哪里**：审查状态、每轮的 zip、提示词、ChatGPT 原始回答和报告都在 `~/.chatgpt-review/` 下；对话用量账本在 `~/.chatgpt-bridge/`。**审查本身不会往你的项目目录里写任何东西**；改代码只发生在你确认要改哪些之后，或者你开了「自动」模式。
 
 **剪贴板**：取回答案要借用剪贴板，脚本会先备份、用完恢复。
 
-**上下文**：每个 ChatGPT 对话都记一本用量账（中文约 1 字 1 token，故意估高；附件按文本量计、封顶 3 万，因为 Pro 是在沙箱里用工具处理 zip，不会整包读进上下文）。默认预算 9 万（官方公布的 128K 输入上限的七成），续问会超出时自动开新对话，并把之前的结论作为交接摘要带过去。可以用 `CHATGPT_BRIDGE_BUDGET`、`CHATGPT_BRIDGE_ATTACH_TOKENS` 调整。
+**上下文估算**：每个 ChatGPT 对话记一本本地估算账（中文约 1 字 1 token，其余约 3.5 字符 1 token；附件估算值最多记 3 万）。默认预算 9 万 token，这两个值都是项目的记账策略，**不是官方上下文上限，也不是实际用量的上界**。桥接看不到 Chat 内部的工具输出、文件读取和完整上下文，不能据此保证审查覆盖率。续问估算超预算时退出码 `3`，由调用方准备交接摘要并开启新对话。`CHATGPT_BRIDGE_BUDGET`、`--budget` 和 `CHATGPT_BRIDGE_ATTACH_TOKENS` 只影响估算账本，**不会改变附件上传字节上限**。
 
 ## 已知限制
 
-- **依赖 ChatGPT 界面**：按钮名（Send、Copy、New chat……）或布局一改就可能失效；目前只适配英文界面。在 ChatGPT 桌面版 155.x、Peekaboo 4.2.2、macOS 26.2 上测试。
+- **依赖 ChatGPT 界面**：按钮名（Send、Copy、New chat……）或布局一改就可能失效；目前只适配英文界面。历史版本在 ChatGPT 桌面版 155.x、Peekaboo 4.2.2、macOS 26.2 上测试；本次加固通过隔离界面的本地测试，尚未完成当前客户端实传验收。
 - 只支持 macOS。多个任务可以并行生成，点击、发送、复制这几秒钟会排队。
 - 只取回 ChatGPT 的文字回答；它在沙箱里生成的文件（比如它自己的报告、证据包）不会自动下载。
 - token 数是估算值，不是 ChatGPT 的真实计数。
@@ -146,7 +150,7 @@ python3 ~/.claude/skills/ask-chatgpt/chatgpt_bridge.py status
 - `python3 ~/.claude/skills/ask-chatgpt/chatgpt_bridge.py stop`：总开关。所有会话里的任务都在下一次点击前停下，正在等待的也会退出；等它们真的全部结束后再退出 Peekaboo，还有没停的会逐个列出来（`stop --force` 强制结束）。关着时任何命令都不会碰屏幕，退出码 5。`resume` 重新打开。
 - `status`：显示开关状态、Peekaboo 是否在运行、哪些任务正在用屏幕（进程号、做什么、从何时开始）。只是查看时不会启动 Peekaboo。
 - 任务只在需要时才启动 Peekaboo.app，最后一个任务结束时把它关掉。
-- 键盘鼠标空闲满 30 秒任务才会点击或打字，无人值守的任务是 120 秒，所以你在用电脑时它不会抢前台。可以用 `CHATGPT_BRIDGE_USER_IDLE` 调整。
+- 默认键盘鼠标空闲满 30 秒才操作界面。无法可靠区分人工与脚本输入，因此脚本自己的输入也重新计时，多步操作会更慢；空闲检测失败则停止。`CHATGPT_BRIDGE_USER_IDLE` 可调整等待时间，设为 `0` 会明确关闭空闲等待。
 - 任务找不到自己的对话时，最多搜索 3 轮就放弃并报告。搜索时只看其他对话，绝不复制它们的内容。
 
 ## 故障排查
@@ -157,13 +161,15 @@ python3 ~/.claude/skills/ask-chatgpt/chatgpt_bridge.py status
 | 权限报错，或读到的元素很少 | 确认 Peekaboo.app 的权限 `permissions status` 三项都是 Granted（任务需要时会自己启动它） |
 | 退出码 5 / `switched off` | 总开关关着，`resume` 打开 |
 | 日志显示 `someone is using the computer` | 正常：你在用电脑，任务等键盘鼠标空闲后再继续 |
-| 日志显示 `another run is using the ChatGPT window` / `a draft is open` | 正常：另一个任务正在点击或复制（几秒钟），或者你的输入框里有草稿。它会等一下再继续，不会打断 |
+| 日志显示 `another run is using the ChatGPT window` / `a draft is open` | 正常：另一个任务正在点击或复制（操作阶段），或者你的输入框里有草稿。它会等一下再继续，不会打断 |
 | `Clicked Copy but the clipboard never changed` | 复制那一刻鼠标或焦点被占用，或者 ChatGPT 的复制按钮卡在「已复制」。桥接会改用回答里代码块自己的复制按钮；还不行就等一下再 `read-last` |
-| 超时，或进程中途退出 | 先 `status`。还在生成就用 `wait --conversation "标题"` 接管；已经答完就用 `read-last` |
+| 超时，或进程中途退出 | 先 `status`。还在生成就用 `wait --conversation "标题" --marker "恢复记录中的标识"` 接管；已经答完就用 `read-last` |
 | `is not visible in the sidebar` | 要续问的对话不在侧边栏可见范围内，改用新对话 |
-| 退出码 3 | 对话快满了，Claude 会生成交接提示词并新开对话 |
+| 退出码 3 | 本地估算预算不足；生成交接提示词并新开对话（不是服务端上下文用量证明） |
 
-**出错时不要直接重发**：失败的那次可能已经发出去了，重发会重复。
+**任务识别与恢复**：每次 `ask` 自动生成唯一 `bridge-run-...` 标识，写入提示词并要求答案回显。上传和输入前必须确认 Chat 模式、目标聊天身份及无草稿；同名标题不能替代身份核验。答案标识不匹配时不会写入结果。
+
+发送前会在 `~/.chatgpt-bridge/requests/<标识>.json` 保存恢复记录，日志显示路径。`sending` / `delivery_unknown` 表示发送状态不确定，`sent` 表示已在聊天中看到本次请求标识，`completed` 表示答案已取回。**状态不确定时不要直接重发**；先核实界面，再用恢复记录中的标识执行 `wait --conversation "标题" --marker "标识"`。旧账本没有标识或检测到同名聊天冲突时，必须开新对话并交接背景，不能仅凭标题续问。
 
 ---
 
@@ -180,12 +186,12 @@ python3 $B stop                                            # 总开关：停下�
 python3 $B ask - --new-chat --out answer.md < prompt.md    # 新对话提问（提示词从文件读）
 python3 $B ask - --new-chat --attach code.zip --timeout 10800 --poll 10 --out answer.md < prompt.md
 python3 $B ask - --conversation "对话标题" --out answer2.md < followup.md   # 在指定对话里续问
-python3 $B wait --conversation "对话标题" --out answer.md  # 接管一个还在生成的回答
+python3 $B wait --conversation "对话标题" --marker "bridge-run-<恢复记录中的ID>" --out answer.md  # 接管一个还在生成的回答
 python3 $B read-last --out answer.md                       # 重新复制当前对话最后一条回答
 python3 $B usage                                           # 查看所有对话的用量账本
 ```
 
-`--out` 会同时写出 `answer.md.meta.json`（对话标题、已用 token、预算、剩余）。退出码：`0` 成功，`1` 出错，`3` 续问会超出该对话的预算。
+`--out` 会同时写出 `answer.md.meta.json`（对话标题、请求标识 marker、本地估算 token、估算预算、估算剩余）。退出码：`0` 成功，`1` 出错（包括附件超过上传大小上限），`3` 续问会超出本地 token 预算，`5` 总开关关闭。
 
 ### review.py：审查循环
 
@@ -260,6 +266,18 @@ skills/
 examples/demo_project/    # 埋了 bug 的示例项目
 install.sh
 ```
+
+## 本地测试
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+测试使用临时文件、稀疏文件和界面替身，不启动 Peekaboo、不上传文件。覆盖上传字节边界、错误出口和打包／导入结果／复审／报告流程。`expected failure` 是已复现但尚未修复的问题，不代表这些功能正确：
+
+- 首次打包后改变 `--chunk-tokens` 不会重分已有分区。
+- 回答列出未读文件时，`next` 仍可能返回 `done: true`，未改动文件不会自动重审。
+- `CHANGES.diff` 未经过敏感内容过滤，删除行中的密钥仍可能进入上传包。
 
 ## License
 

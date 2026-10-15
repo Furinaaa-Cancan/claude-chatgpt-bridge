@@ -656,7 +656,7 @@ def cmd_report(args):
         + "</div>" for p in answered)
     usage_rows = "".join(
         f'<div class="usage"><span>{"第 %d 部分 · " % p["k"] if rnd["total_parts"] > 1 else ""}{e(p.get("conversation") or "—")}</span>'
-        f'<span>{(p.get("usage") or {}).get("tokens_used") or 0} / {(p.get("usage") or {}).get("budget") or 0} tokens</span>'
+        f'<span>本地估算 {(p.get("usage") or {}).get("tokens_used") or 0} / 预算 {(p.get("usage") or {}).get("budget") or 0} tokens（非实际上下文用量）</span>'
         f'<div class="bar"><i style="width:{min(100, round(100 * ((p.get("usage") or {}).get("tokens_used") or 0) / ((p.get("usage") or {}).get("budget") or 1)))}%"></i></div></div>'
         for p in answered)
     pending = [p["k"] for p in rnd["parts"] if not p.get("answer")]
